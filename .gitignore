@@ -9,6 +9,8 @@ src/settings/
 
 # Database (large binary, tracked separately if needed)
 data/DWTrader.db
+# Stale nested copy from TEOFITS parent repo
+kalshi-bot-python/
 data/DWTrader.db-wal
 data/DWTrader.db-shm
 data/backtest_*.db
