@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "notebooklm": {
+      "command": "node",
+      "args": ["C:/Users/dhernandez/AppData/Roaming/npm/node_modules/notebooklm-mcp/dist/index.js"],
+      "env": {
+        "HEADLESS": "false"
+      }
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pytest:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python check_data.py)",
+      "Bash(python check_tickers.py)",
+      "Bash(python ingest_app.py)",
+      "Bash(python scripts/*)",
+      "Bash(docker-compose build)",
+      "Bash(docker-compose logs:*)",
+      "Bash(docker-compose ps)",
+      "Bash(git status)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(npx notebooklm-mcp@latest)",
+      "Read(src/**)",
+      "Read(tests/**)",
+      "Read(scripts/**)",
+      "Read(data/DWTrader.db)",
+      "Read(.env)",
+      "Read(docker-compose.yml)",
+      "Read(Dockerfile-ingest)"
+    ],
+    "deny": [
+      "Bash(docker-compose up:*)",
+      "Bash(docker-compose down:*)",
+      "Bash(git push:*)",
+      "Bash(rm -rf:*)"
+    ]
+  },
+  "model": "claude-sonnet-4-6",
+  "rules": [
+    ".claude/rules/code-style.md",
+    ".claude/rules/testing.md",
+    ".claude/rules/api-conventions.md",
+    ".claude/rules/safety.md"
+  ]
+}
