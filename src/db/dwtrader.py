@@ -11,7 +11,12 @@ logger = logging.getLogger(__name__)
 
 class DWTraderDB:
     def __init__(self, conn_str: Optional[str] = None):
-        self.conn_str = conn_str or os.environ["AZURE_SQL_CONN_STR"]
+        self.conn_str = conn_str or os.environ.get("AZURE_SQL_CONN_STR")
+        if not self.conn_str:
+            raise RuntimeError(
+                "AZURE_SQL_CONN_STR is not set. "
+                "Add it to .env locally or as an Azure Web App application setting."
+            )
         self.init_db()
 
     # ------------------------------------------------------------------

@@ -3,7 +3,7 @@ name: Build and Deploy to Azure Web App
 on:
   push:
     branches: [main]
-  workflow_dispatch:        # allow manual trigger from GitHub UI
+  workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/diegoou8/kalshibot
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write       # push to ghcr.io
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -36,22 +36,13 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      # ── 2. Deploy to Azure Web App ──────────────────────────────────────────
+      # ── 2. Log in to Azure ──────────────────────────────────────────────────
       - name: Log in to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Update container image + registry credentials
-        run: |
-          az webapp config container set \
-            --name KBot \
-            --resource-group bot \
-            --container-image-name ${{ env.IMAGE }}:${{ github.sha }} \
-            --container-registry-url https://ghcr.io \
-            --container-registry-user diegoou8 \
-            --container-registry-password ${{ secrets.GHCR_PAT }}
-
+      # ── 3. Set env vars FIRST so they exist when the container starts ───────
       - name: Sync environment variables to Web App
         run: |
           az webapp config appsettings set \
@@ -64,7 +55,16 @@ jobs:
               GUMBEL_MODE="half" \
               TRADE_CYCLE_INTERVAL_SECS="300" \
               MONITOR_INTERVAL_SECS="120" \
-              TZ="America/Chicago"
+              TZ="America/Chicago" \
+              WEBSITES_PORT="8000"
 
-      - name: Restart Web App
-        run: az webapp restart --name KBot --resource-group bot
+      # ── 4. Update container image (triggers restart with env vars already set)
+      - name: Update container image and registry credentials
+        run: |
+          az webapp config container set \
+            --name KBot \
+            --resource-group bot \
+            --container-image-name ${{ env.IMAGE }}:${{ github.sha }} \
+            --container-registry-url https://ghcr.io \
+            --container-registry-user diegoou8 \
+            --container-registry-password ${{ secrets.GHCR_PAT }}
