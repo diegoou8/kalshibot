@@ -1,30 +1,11 @@
 version: '3.8'
 
 services:
-
-  # Layer 1: WebSocket + weather ingestion — always on, no trading
-  layer1-ingest:
+  bot:
     build:
       context: .
       dockerfile: Dockerfile-ingest
-    container_name: layer1-ingest
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      - ENV_EXECUTION_MODE=PAPER
-      - TZ=America/Chicago
-    volumes:
-      - ./data:/app/data
-      - ./Credentials:/app/Credentials:ro
-    command: ["python", "ingest_app.py"]
-
-  # Trading loop: scan → decide → enter → monitor → exit
-  # Runs continuously; trade_cycle fires on a schedule inside the container.
-  trader:
-    build:
-      context: .
-      dockerfile: Dockerfile-ingest
-    container_name: kalshi-trader
+    container_name: kalshi-bot
     restart: unless-stopped
     env_file: .env
     environment:
@@ -32,9 +13,6 @@ services:
       - TZ=America/Chicago
       - TRADE_CYCLE_INTERVAL_SECS=300
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data          # halt.flag + ML model artifacts (no SQLite)
       - ./Credentials:/app/Credentials:ro
-    depends_on:
-      - layer1-ingest
     command: ["python", "bot_runner.py"]
-

@@ -260,12 +260,88 @@ The notebook confirmed our approach is mathematically sound and suggested these 
 
 **Brier score status:** 0.5471 (inflated by 53 duplicate T76 predictions with ~99% p). New predictions from APR23 forward will be correct.
 
-### Architecture Status Update
+### Architecture Status Update (2026-04-23)
 | Component | Status |
 |-----------|--------|
 | Trade cycle dedup (cross-cycle) | ✅ Fixed |
 | `_p_above` probability formula | ✅ Fixed |
+| PnL attribution table + script | ✅ `analytics/pnl_decomposition.py` |
+| Horizon-conditioned σ²(h) | ✅ Wired — data accumulating |
+| T_max Gumbel correction (PF) | ✅ `daily_max_var()` + `daily_max_p_above()` |
 | APR23 duplicate positions | Settling today — dedup blocks new entries |
+
+### First PnL Decomposition Report Findings
+- DEN/LAX/MIA Brier ≈ 0.0001 — NO-side model is extremely well calibrated
+- CHI Brier = 0.9792 — poisoned by 53 corrupt T76 predictions (now fixed); will clear as new data comes in
+- Negative alpha on LAX/DEN/MIA (-0.85 to -0.89) is correct for NO bets (our P(YES) < market price)
+- CHI positive alpha (+0.69) was from the inverted `_p_above` bug — now fixed
+- lvr_cents not yet populated — fee drag unknown until log_execution_record wired
+
+### 3 Quick Wins Shipped (2026-04-23 afternoon)
+
+**1. PnL Attribution Table + Analytics Script**
+- `src/db/dwtrader.py`: new `trade_attribution` table (17 columns: execution_id, ticker, city, side, horizon_bin, fill_price_cents, mid_at_fill_cents, predicted_p, market_implied_p, realized_pnl_cents, slippage_cents, fees_cents, holding_time_hrs, ...)
+- `executions` table: new `lvr_cents REAL` column (migration applied live)
+- `analytics/pnl_decomposition.py`: standalone report — model alpha by city, realized PnL, slippage histogram, fee drag, Brier by city
+
+**2. Horizon-Conditioned σ²(h)**
+- `ar1_residuals` table: new `horizon_hrs REAL` column (migration applied live)
+- `src/db/dwtrader.py`: `log_ar1_residual()` now accepts `horizon_hrs` param
+- `src/index.py` Phase 1c: passes `tau_hrs` when logging every residual
+- `scripts/calibrate_sigma.py`: fits σ per horizon bin (0-6h, 6-12h, 12-24h, 24-48h, 48h+), writes `data/sigma_by_horizon.json`
+- `src/brain/weather_estimator.py`: `estimate_p_yes()` now reads horizon JSON; priority: horizon-JSON > per-city MLE > flat 4.0°F
+- Status: wired and accumulating — σ²(h) table will populate after 14+ days of residuals per bin
+
+**3. T_max Gumbel Correction in Particle Filter**
+- `src/layer2/particle_filter.py`: added `daily_max_var(sigma_intraday=2.0)` and `daily_max_p_above(threshold, sigma_intraday=2.0)` to `TemperatureParticleFilter`
+- Gumbel transform: T_max particles = T_resolution particles + Gumbel(μ=σ·γ_EM, β=σ·π/√6) where γ_EM=0.5772
+- `src/index.py` `_run_pf_variance()`: KXHIGH tickers now use `pf.daily_max_var()` instead of raw OU variance
+- Verified: raw OU var ≈ 4.0, Gumbel-corrected var ≈ 13.7 (3.4× wider — correct for path extremes)
+
+### Second Opinion — 2026-04-24 (Critical Review)
+
+Two independent reviews (NotebookLM + external quant desk) converged on the same message: **stop adding sophisticated layers that don't close the actual diagnostic gaps.** The stack is mathematically capable but the bottlenecks are more basic. The question is not "what is the best model in theory?" — it is "what is the smallest set of changes that reduces systematic PnL leakage and improves diagnosis?"
+
+**Key structural risks identified:**
+
+1. **T_max Gumbel is a patch, not a solution.** The var jump from ~4 to ~13.7 (3.4×) is large enough to be a calibration risk. The Gumbel extreme-value logic assumes roughly independent draws — OU is highly autocorrelated. The effective number of independent excursion opportunities is far smaller than the number of time steps. This can overinflate tail variance and make far OTM YES contracts look too attractive. Do NOT treat this as a settled improvement — validate it against realized settlement frequencies before trusting it.
+
+2. **T_max consistency gap.** `_p_above` and `_run_pf_variance()` now use Gumbel-corrected state. But `LogitJD` brain drift, `sigma_eff`, and the EV engine still reference raw OU variance. One part of the stack thinks the latent object is "daily max," the other still prices "point temperature." This is a live mispricing source — fix before anything else.
+
+3. **Possible double-counting.** The pipeline now has: raw forecast → AR(1) bias → jump blend → particle filter → T_max Gumbel. Five corrections, all potentially nudging upward from the same event. Track each stage per-market and confirm one stage dominates; multiple stages amplifying the same signal is overcounting.
+
+4. **Brier misleads for trading.** Good Brier can coexist with bad PnL if edge is too small after fees, entry is late, or you concentrate in wrong bins. Need: PnL by strike distance, PnL by spread bucket, PnL by quote age, realized edge by decile of predicted edge.
+
+5. **Calibration window too short.** 14 days is enough to start — not enough to trust city-level or horizon-level parameters. Use hierarchical conservatism: shrink horizon-bin σ toward city σ toward global σ when data is thin.
+
+### Revised Priority List (Pragmatic, No Vanity Research)
+
+**Tier 1 — Build now (diagnostic and correctness gaps)**
+
+| # | Item | File | Why |
+|---|------|------|-----|
+| 1 | **Wire `lvr_cents` at fill time** | `src/logging/trade_logger.py` | Can't distinguish model loss vs execution loss without it. Single most important missing measurement. |
+| 2 | **T_max consistency audit** | `src/index.py`, `src/brain/logit_jd.py` | Correctness, not research. P(YES) source, variance source, sigma_eff source, drift source must all agree for T_max contracts. Add logging assertion. |
+| 3 | **Adaptive bias filter** | `src/brain/bias_filter.py` (new) | Replace fixed φ=0.4 AR(1) with `b_t = b_{t-1} + K_t(e_t − b_{t-1})` where K_t rises with residual variance or sign persistence. Simple, not fancy. |
+| 4 | **Uncertainty-penalized Kelly** | `src/layer2/ev_engine.py` | Replace fixed 0.25× with `f = f_base / (1 + λ·rolling_brier)`. Sizing errors kill faster than mean errors. |
+| 5 | **Same-day concentration cap** | `src/risk/manager.py` | Before copulas: max gross exposure per settlement date, max heat-side positions, simple ±5°F shock test on portfolio PnL. |
+
+**Tier 2 — Build after Tier 1 is done and validated**
+
+| # | Item | File | Why |
+|---|------|------|-----|
+| 6 | **Basic microstructure filters** | `src/layer2/gating_logic.py` or `src/index.py` | Quote age, spread z-score, top-of-book imbalance — use as trade suppressors/size dampeners, not alpha. |
+| 7 | **PnL monitoring by segment** | `analytics/pnl_decomposition.py` | Add: PnL by strike distance, PnL by spread bucket, realized edge by predicted-edge decile. Brier alone is not enough. |
+
+**Deferred — Do not build yet**
+
+| Item | Reason |
+|------|--------|
+| Vine Copula CVaR | Simple concentration cap gets most of the protection. Copula adds fragility and overfitting risk at this data volume. |
+| KL Projection Gap gate | Too abstract. Fix attribution and sizing first. |
+| Lévy jump-compensated RN drift | Drift refinement is not the next bottleneck. Validate T_max consistency first. |
+| Signature / Neural RDE / path geometry | Research vanity. Do not touch. |
+| Complex microstructure alpha stack | Basic filters first. |
 
 ---
 
@@ -570,3 +646,344 @@ File: `scripts/stress_test.py`
 | 10 | Vine Copula CVaR cap | Both | MEDIUM (needs 14d data) |
 | 11 | Tail stress test script | QA only | LOW |
 | 12 | Backtest framework (LOB-aware) | Both | FUTURE |
+
+---
+
+## Session: 2026-04-26 — Third-Party Review + Calibration Fixes
+
+### Settlement Results (since last session)
+| Date | Fills | Net |
+|------|-------|-----|
+| APR22 fills | 87 | -$11.74 |
+| APR23 fills | 16 | +$3.86 |
+| APR24 fills | 2 | -$0.32 |
+| **Running total** | | **-$12.30** |
+
+APR22 loss dominated by duplicate positions (pre-fix bug): MIA-B79.5 accumulated 7 positions × -$1.52 = -$10.64 alone.
+
+### Critical DB Findings (2026-04-26)
+
+**Win rate by city (NO bets):**
+| City | N | Win Rate | Brier |
+|------|---|----------|-------|
+| DEN | 177 | **94%** | 0.06 |
+| PHIL | 11 | 100% | 0.002 |
+| LAX | 176 | 76% | 0.23 |
+| THOU | 104 | 70% | 0.30 |
+| MIA | 210 | 62% | 0.34 |
+| CHI | 36 | **42%** | **0.51** |
+
+**P(YES) on NO bets: avg = 5.0%** — model is extremely overconfident on NO side. When we lose (183 cases), avg P(YES) was 3.6% — we were 96%+ confident and still wrong 26% of the time.
+
+**Root cause:** Using point-temperature σ=4°F in `_p_above` for KXHIGH (daily max) contracts. The Gumbel correction inflates `posterior_var_T` in the PF but the probability estimate in `estimate_p_yes` still uses raw 4°F — they are inconsistent. Wider σ would correctly give higher P(YES), meaning we'd recognize more risk in our NO bets and trade less aggressively.
+
+### Third-Party Review Findings (2026-04-26)
+Independent review (NotebookLM + OpenAI) converged on same diagnosis:
+
+1. **T_max consistency gap** — `_p_above` uses σ=4°F (point temperature) but KXHIGH settles on daily max. Need to apply Gumbel scaling to σ in `estimate_p_yes` for HIGH_BAND/HIGH_ABOVE tickers.
+2. **2c EV threshold too low** — below real slippage on thin markets. Raise to 5c.
+3. **Gumbel correction needs a feature flag** — "none"/"half"/"full" modes so we can validate its effect. Currently hard-coded and inconsistently applied across components.
+4. **No spread filter** — we enter markets with any spread. Wide spreads eat edge on fills.
+5. **Max exposure per settlement day missing** — concentration cap per city+date exists (4 contracts), but no total daily gross exposure cap.
+6. **Calibration diagnostics needed** — we don't log P_model vs P_market at trade time for easy auditing.
+7. **LVR only 5 rows populated** — needs verification that fill path always records it.
+
+### Fixes Implemented (2026-04-26)
+
+1. **Positions table `status` column** — migration on startup; 47 stale positions marked `settled`; monitor now checks 2 positions instead of 48. `mark_position_settled()` called when Kalshi says market is closed or tau=0.
+2. **Brier-penalized Kelly** — `effective_mult = 0.25 / (1 + 2 × Brier)`. At current Brier=0.28: effective multiplier = 0.160 (down from 0.25).
+3. **Concentration cap** — 4 contracts hard cap per city+date in `preflight_check`. Prevents another 40-contract disaster.
+
+### Still To Fix This Session (priority order)
+| # | Fix | File | Impact |
+|---|-----|------|--------|
+| 1 | Gumbel feature flag (none/half/full) | `env.py`, `particle_filter.py`, `index.py` | Correct T_max variance across components |
+| 2 | T_max σ consistency in `estimate_p_yes` | `weather_estimator.py` | P(YES) will reflect daily-max risk, not point temp |
+| 3 | Raise min_edge_cents 2c → 5c | `engine.py` | Stop entering marginal trades |
+| 4 | Spread filter | `index.py` Phase 1a | Skip illiquid / wide-spread markets |
+| 5 | Max daily gross exposure | `risk/manager.py` | Portfolio-level cap on same-day positions |
+| 6 | Calibration diagnostic log | `index.py` | P_model vs P_market logged per candidate |
+
+---
+
+## Session: 2026-04-27 — Correctness Fixes, Calibration Safety, Analytics Writeback
+
+### Objective
+Senior quant pass: fix correctness, calibration safety, and analytics writeback gaps. No new models. All 6 priority items implemented and 19/19 unit tests passing.
+
+### Changes Implemented
+
+**1. T_max sigma clamp 0.01/0.99 → 0.03/0.97** (`src/brain/weather_estimator.py`)
+- `_p_above()`: clamp widened from ±1% to ±3%; logs DEBUG `PROB_CLAMP` when applied
+- `estimate_p_yes()` HIGH_BAND path: named intermediate `p_band`, same clamp with DEBUG log `PROB_CLAMP_BAND`
+- Prevents extreme overconfidence (99%+ NO) that contributed to unexpected losses
+
+**2. Analytics writeback — all four gaps closed**
+
+| Gap | Fix | File |
+|-----|-----|------|
+| `risk_score` always 0.0 | `kelly_fraction × price_cents / 100.0` | `src/logging/trade_logger.py` |
+| `lvr_cents` always NULL | `fill_price - scan_mid_cents` written on every fill | `src/logging/trade_logger.py` |
+| `trade_attribution` 0 rows | `log_trade_attribution()` called after every execution | `src/logging/trade_logger.py` |
+| Realized P&L never written | `settle_position_with_outcome()` called from monitor | `src/index.py` + `src/db/dwtrader.py` |
+
+**3. Adaptive city risk control** (`src/risk/city_guard.py` — new file)
+- `CityRiskGuard` class with persistent JSON state (`data/city_blocks.json`)
+- Rolling Brier per city (window=30, min n=10):
+  - Brier < 0.20 → 1.0× sizing
+  - 0.20 ≤ Brier < 0.25 → 0.5× sizing, logs `BRIER_THROTTLE_APPLIED`
+  - Brier ≥ 0.25 + n ≥ 10 → 24h block, logs `BLOCKED_CITY_BRIER_GUARD`
+  - Auto-recovery: logs `CITY_REACTIVATED` when block expires
+- Tail-risk guard: ≥ 2 cases of p < 5% but outcome=YES in last 20 → 24h block, logs `BLOCKED_CITY_TAIL_RISK`
+- Wired into `trade_cycle` in `src/index.py` via `city_guard.refresh()` + `city_guard.check()`
+- Size multiplier applied: `intent.target_qty = max(1, int(qty × mult))`
+
+**4. Concentration guard — fixed a pre-existing silent bug** (`src/risk/manager.py`)
+- Added `_ticker_settle_date()` module-level helper: parses `KXHIGHLAX-26APR28-T64` → `2026-04-28`
+- Fixed filter: was `settle_date in p["ticker"]` (ISO "2026-04-28" never matched raw ticker) → now `_ticker_settle_date(p["ticker"]) == settle_date`
+- Added `MAX_POSITIONS_PER_SLOT = 2` cap (distinct open positions per city+date)
+- Position-count block runs before contract-count block; logs `BLOCKED_CITY_CONCENTRATION`
+
+**5. Failed-execution cooldown** (`src/db/dwtrader.py` + `src/index.py`)
+- `db.get_canceled_order_count(ticker, trade_date)` — counts canceled/timeout orders for ticker on a UTC date
+- Phase 3 in `trade_cycle`: 3+ cancels → skip ticker, logs `BLOCKED_CANCEL_COOLDOWN`
+
+**6. Four new DB methods** (`src/db/dwtrader.py`)
+- `get_rolling_brier_by_city(city, window, min_obs)` → `(Optional[float], int)`
+- `get_tail_risk_count(city, window, p_threshold)` → `int`
+- `get_canceled_order_count(ticker, trade_date)` → `int`
+- `settle_position_with_outcome(ticker, yes_won)` → computes and writes realized P&L
+
+### Bug Fixes (pre-existing)
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| Concentration guard never blocked | `settle_date in p["ticker"]` compared ISO date against raw ticker string | `_ticker_settle_date()` helper + ISO comparison |
+| Fill detection missed polled fills | Outer `status == "submitted"` check was unreliable for polled orders | Dropped outer check; condition: `order_data.get("status") == "executed"` |
+| Fill price extraction wrong | Always used `intent.price_cents` even when Kalshi returned actual fill price | Side-aware key (`yes_price`/`no_price`) with fallback chain |
+
+### Unit Tests (`tests/test_guards.py` — 19 tests, all passing)
+
+| Suite | Tests | Coverage |
+|-------|-------|---------|
+| `TestProbClamp` | 3 | Below floor, above ceiling, at-the-money |
+| `TestCityRiskGuard` | 6 | Throttle, block, insufficient data, auto-recovery, tail risk, good calibration |
+| `TestConcentrationGuard` | 3 | Blocks at max positions, allows first, blocks at contract cap |
+| `TestTradeAttributionWriteback` | 1 | Full FK chain: scan→intent→order→execution→attribution |
+| `TestLvrPopulation` | 2 | With and without scan_mid |
+| `TestCancelCooldown` | 4 | 3 cancels, 2 cancels (pass), yesterday's (ignored), timeout orders |
+
+```
+19 passed in 3.03s
+```
+
+### Architecture Status Update (2026-04-27)
+
+| Component | Status |
+|-----------|--------|
+| Adaptive city risk control (Brier-gated) | ✅ Complete — `src/risk/city_guard.py` |
+| City block persistence | ✅ Complete — `data/city_blocks.json` |
+| Tail-risk guard per city | ✅ Complete — wired in `CityRiskGuard.refresh()` |
+| Concentration guard (2 pos / 4 contracts) | ✅ Fixed — was silently broken since APR22 |
+| Cancel cooldown (3 strikes) | ✅ Complete |
+| `trade_attribution` writeback | ✅ Fixed — all fills now write attribution row |
+| `lvr_cents` population | ✅ Fixed — fill_price − scan_mid at execution time |
+| `realized_pnl_cents` on settlement | ✅ Fixed — `settle_position_with_outcome()` wired |
+| `risk_score` in decision_log | ✅ Fixed — kelly_fraction × price ratio |
+| Probability clamp (0.03/0.97) | ✅ Fixed — with PROB_CLAMP debug logging |
+
+---
+
+## Next Session Plan: 2026-04-28 — Calibration Validation + Controlled Experimentation
+
+**Goal:** Determine whether the model has directional bias and whether Gumbel correction improves or degrades calibration. No new models, no threshold tuning, no trading logic changes.
+
+### Priority 1 — Gumbel Experiment Framework
+
+**Files:** `src/config/env.py`, `src/layer2/particle_filter.py`, `src/brain/weather_estimator.py`, `src/index.py`
+
+Add `GUMBEL_MODE` config (default: `"none"`) that gates the Gumbel correction consistently across both paths:
+
+| Mode | `estimate_p_yes()` | PF variance (`_run_pf_variance`) |
+|------|-------------------|----------------------------------|
+| `none` | raw σ=4°F (point temp) | raw OU variance |
+| `half` | σ scaled by √(1 + π²/6) ≈ ×1.28 | 50% blend of OU + Gumbel var |
+| `full` | σ scaled by Gumbel factor | full `daily_max_var()` |
+
+- Log active mode on every cycle: `GUMBEL_MODE=full cycle_start`
+- Store `gumbel_mode` on every `calibration_diagnostics` row so experiment results are mode-tagged
+- Test: verify `estimate_p_yes` produces wider P(YES) under `full` vs `none` for the same ticker
+
+### Priority 2 — Calibration Diagnostics Table
+
+**Files:** `src/db/dwtrader.py`, `src/index.py` Phase 1d, `analytics/calibration_report.py`
+
+New DB table `calibration_diagnostics`:
+
+```sql
+CREATE TABLE IF NOT EXISTS calibration_diagnostics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    city TEXT,
+    horizon_bucket TEXT,        -- '0-6h','6-12h','12-24h','24-48h','48h+'
+    strike_distance_bucket TEXT,-- 'far_otm','otm','atm','itm','far_itm'
+    p_model REAL,
+    p_market REAL,
+    edge REAL,                  -- p_model - p_market
+    trade_side TEXT,            -- 'yes','no',null (evaluated but not traded)
+    gumbel_mode TEXT,
+    env_mode TEXT
+);
+```
+
+Log every evaluated market in Phase 1d (after `estimate_p_yes` runs), regardless of whether it trades.
+
+Daily aggregate query (run in `analytics/calibration_report.py`):
+```sql
+SELECT city, horizon_bucket, strike_distance_bucket,
+       AVG(p_model - p_market) AS avg_edge,
+       AVG((p_model - actual_outcome)*(p_model - actual_outcome)) AS brier,
+       COUNT(*) AS n,
+       gumbel_mode
+FROM calibration_diagnostics
+GROUP BY city, horizon_bucket, strike_distance_bucket, gumbel_mode
+```
+
+### Priority 3 — Bias Detection Alerts
+
+**File:** `src/index.py` (end of trade cycle) or `analytics/calibration_report.py`
+
+After each cycle, aggregate `calibration_diagnostics` per city for the rolling 7-day window:
+- If `avg(p_model - p_market) < -0.05` for a city → `logger.warning("MODEL_NO_BIAS: %s avg_edge=%.3f", city, avg_edge)`
+- If `avg(p_model - p_market) > +0.05` for a city → `logger.warning("MODEL_YES_BIAS: %s avg_edge=%.3f", city, avg_edge)`
+- Threshold: only alert when `n >= 20` (avoid noise on thin data)
+- Do NOT block or size-adjust based on this — observation only for now
+
+### Priority 4 — Analytics Completeness Validation
+
+**File:** `src/logging/trade_logger.py`
+
+Add assertion-style checks after every fill write:
+- If `execution_id` returned but `trade_attribution` insert fails → `logger.error("ATTRIBUTION_WRITE_FAILED: %s exec_id=%d", ticker, execution_id)`
+- If `scan_mid_cents` is not None but `lvr_cents` ends up NULL in DB → `logger.error("LVR_NULL_UNEXPECTED: %s", ticker)`
+- After `settle_position_with_outcome()`: verify `realized_pnl_cents` is non-NULL in positions table → `logger.error("REALIZED_PNL_NOT_WRITTEN: %s", ticker)` if still NULL
+
+No silent failures — every gap gets a named log line.
+
+### Priority 5 — Experiment Run Log
+
+**File:** `analytics/experiment_log.py` (new) or appended to `calibration_report.py`
+
+After each trading session, write one summary row to `experiment_runs` table:
+
+```sql
+CREATE TABLE IF NOT EXISTS experiment_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date TEXT,
+    gumbel_mode TEXT,
+    total_trades INTEGER,
+    yes_trades INTEGER,
+    no_trades INTEGER,
+    avg_edge_cents REAL,
+    avg_lvr_cents REAL,
+    realized_pnl_cents REAL,
+    brier_score REAL,
+    n_settled INTEGER
+);
+```
+
+This lets us compare `gumbel_mode=none` vs `half` vs `full` runs side-by-side once we have enough settled data.
+
+### What We Are NOT Doing
+
+| Item | Reason |
+|------|--------|
+| Raise min_edge_cents 2c → 5c | Deferred — change trading logic only after bias direction confirmed |
+| Spread filter | Deferred — same reason |
+| Kalman bias filter | Deferred — AR(1) stays until calibration baseline is measured |
+| Vine Copula | Deferred — needs 14d+ data, out of scope |
+| Backtest framework | FUTURE |
+
+### Definition of Done for APR28 Session
+
+- [x] `GUMBEL_MODE` env var wired into both `estimate_p_yes` and `_run_pf_variance`
+- [x] `calibration_diagnostics` table created and populated every cycle
+- [x] `analytics/calibration_report.py` prints daily aggregate by city × horizon × strike distance × mode
+- [x] `MODEL_NO_BIAS` / `MODEL_YES_BIAS` alerts firing in logs when threshold crossed
+- [x] All `trade_attribution`, `lvr_cents`, `realized_pnl_cents` gaps have named error logs
+- [x] `experiment_runs` table records one summary row per session
+- [x] Tests: 4 new tests added → 23 total, all passing
+
+---
+
+## 3-Day Gumbel A/B/C Experiment: 2026-04-28 → 2026-04-30
+
+**Goal:** Causally test all three Gumbel modes under similar market regimes. One mode per day, then compare with the holistic report.
+
+### A/B/C Protocol
+
+| Day | Mode | Switch command |
+|-----|------|----------------|
+| APR28 | `half` (baseline — already running) | done |
+| APR29 | `none` (control — no correction) | `python scripts/set_gumbel_mode.py none` |
+| APR30 | `full` (maximum correction) | `python scripts/set_gumbel_mode.py full` |
+
+**Run each morning before starting the bot.** Script updates `.env` and prints a reminder for the next day.
+
+After each day's session:
+```bash
+python analytics/calibration_report.py --days 3
+```
+
+### Report Structure (7 sections)
+
+| # | Section | Key question |
+|---|---------|-------------|
+| 0 | Experiment protocol | Which mode runs today? What's next? |
+| 1 | Mode comparison | Trades, YES%, avg edge, LVR, PnL, PnL/contract, PnL/day, Brier, n_settled, confidence |
+| 2 | City bias summary | avg(P_model − P_market) per city + actionable sigma suggestion |
+| 3 | Tail-risk analysis | Rate (hits/eligible) + severity (avg loss on tail events) |
+| 4 | Mode ranking | Composite rank: PnL + Brier + bias neutrality (LOW_CONFIDENCE flag if n<30) |
+| 5 | PnL by segment | By city / horizon bucket / strike-distance bucket |
+| 6 | Warnings + action | Auto-flags with specific next steps |
+| 7 | Daily log | Per-run fills, YES/NO, Brier, PnL |
+
+### Significance Guardrails
+
+- **n_settled < 30** → `LOW_CONFIDENCE` flag on that mode. Do not switch based on thin data.
+- **n_settled >= 30** → draw conclusions, apply decision rules below.
+- PnL is normalized: `PnL/contract` (fair across trade counts) + `PnL/day` (absolute pace).
+
+### Decision Rules (apply after APR30 session)
+
+| Finding | Action |
+|---------|--------|
+| `none` wins on Brier | Gumbel correction hurts calibration — set `GUMBEL_MODE=none` permanently |
+| `full` wins on Brier | Full correction best — set `GUMBEL_MODE=full` |
+| `half` wins on composite | Keep current default |
+| City avg_bias < −0.05 | Reduce sigma or lower Gumbel for that city |
+| City avg_bias > +0.05 | Increase sigma or raise Gumbel for that city |
+| Tail-risk hits ≥ 2 in any city | Block city 48h, review σ calibration for that city |
+| YES/NO ratio > 80/20 | Raise `MIN_PROB_EDGE_PP` from 15 to 20 |
+| Any mode LOW_CONFIDENCE | Wait — collect 5+ more days before deciding |
+
+### What We Are NOT Doing During the Experiment
+
+| Item | Reason |
+|------|--------|
+| Change mode mid-day | Would corrupt the A/B/C comparison |
+| Raise min_edge_cents | Trading logic changes only after bias direction confirmed |
+| Add Kalman bias filter | AR(1) stays until calibration baseline is measured |
+| Act on LOW_CONFIDENCE results | Sample too small — wait for settlements |
+
+### Submission Prompt (paste into OpenAI + NotebookLM on APR30)
+
+The report footer auto-generates this prompt. Use it verbatim:
+
+> *"This is 3 days of Kalshi weather paper trading data. A/B/C: Apr28=half, Apr29=none, Apr30=full. The bot models P(T_daily_max > threshold) using Student-t + optional Gumbel correction.*
+> *1. Which mode wins on PnL, Brier, and bias neutrality?*
+> *2. Which cities show directional bias and what does that imply?*
+> *3. Are tail-risk levels acceptable?*
+> *4. Which horizon or strike bucket has the most real edge?*
+> *5. Single highest-priority fix before going live?*"
