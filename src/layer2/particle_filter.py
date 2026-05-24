@@ -284,6 +284,45 @@ class TemperatureParticleFilter:
             
         self.conditional_resample()
 
+    def daily_max_var(self, sigma_intraday: float = 2.0, mode: str = "half") -> float:
+        """
+        Return posterior variance adjusted for T_max (daily high).
+
+        mode controls how much of the Gumbel correction is applied:
+          "none" — raw OU variance, no Gumbel offset (point temperature only)
+          "half" — sigma_intraday scaled by 0.5 (conservative; recommended until validated)
+          "full" — full Gumbel offset (original behaviour)
+        """
+        mu_raw = float(np.sum(self.weights * self.particles))
+        var_raw = float(np.sum(self.weights * (self.particles - mu_raw) ** 2))
+
+        if mode == "none":
+            return max(1.0, var_raw)
+
+        scale_factor = 0.5 if mode == "half" else 1.0
+        sigma_eff = sigma_intraday * scale_factor
+        euler_mascheroni = 0.5772156649
+        gumbel_scale = sigma_eff * math.pi / math.sqrt(6)
+        gumbel_loc = sigma_eff * euler_mascheroni
+        gumbel_offsets = np.random.gumbel(loc=gumbel_loc, scale=gumbel_scale, size=self.N)
+        tmax_particles = self.particles + gumbel_offsets
+        mu_max = float(np.sum(self.weights * tmax_particles))
+        var_max = float(np.sum(self.weights * (tmax_particles - mu_max) ** 2))
+        return max(1.0, var_max)
+
+    def daily_max_p_above(self, threshold: float, sigma_intraday: float = 2.0, mode: str = "half") -> float:
+        """P(daily_max > threshold) using Gumbel-transformed particle cloud."""
+        if mode == "none":
+            return float(np.sum(self.weights * (self.particles > threshold).astype(float)))
+        scale_factor = 0.5 if mode == "half" else 1.0
+        sigma_eff = sigma_intraday * scale_factor
+        euler_mascheroni = 0.5772156649
+        gumbel_scale = sigma_eff * math.pi / math.sqrt(6)
+        gumbel_loc = sigma_eff * euler_mascheroni
+        gumbel_offsets = np.random.gumbel(loc=gumbel_loc, scale=gumbel_scale, size=self.N)
+        tmax_particles = self.particles + gumbel_offsets
+        return float(np.sum(self.weights * (tmax_particles > threshold).astype(float)))
+
     def get_posterior_stats(self, bands: List[Tuple[float, float]]) -> Dict:
         """Computes outputs for EV Engine."""
         mu_t = np.sum(self.weights * self.particles)

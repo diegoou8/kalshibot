@@ -11,8 +11,9 @@ from src.services.kalshi_client import client
 from src.db.dwtrader import DWTraderDB
 from src.config.env import Config
 
-from src.decision.engine import DecisionEngine
+from src.decision.engine import DecisionEngine, _kalshi_fee_per_contract
 from src.risk.manager import RiskManager
+from src.risk.city_guard import CityRiskGuard
 from src.execution.manager import ExecutionManager
 from src.logging.trade_logger import TradeLogger
 from src.brain.logit_jd import LogitJumpDiffusionBrain
@@ -23,6 +24,7 @@ from src.brain.weather_estimator import (
     estimate_p_yes, get_ar1_metadata, get_forecast_temp_for_ticker,
     load_city_params, _CITY_MAP, _FORECAST_SIGMA_F, _AR1_PHI
 )
+from analytics.cycle_diagnostics import CycleDiagnostics, compute_strike_z
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] - %(message)s')
 logger = logging.getLogger("IndexOrchestrator")
@@ -30,10 +32,14 @@ logger = logging.getLogger("IndexOrchestrator")
 # Max contracts per order during testing
 TEST_MAX_QTY = 2
 
-# Minimum edge: our fair-value P(YES) must differ from the market-implied P(YES)
-# by at least this many cents before we consider the opportunity worth trading.
-# 15c = 15 percentage points of edge required.
-MIN_EDGE_CENTS = 15
+# Probability-edge gate: fair-value P(YES) must differ from market-implied P(YES)
+# by at least this many percentage points (pp × 100) before we evaluate EV.
+# 15 = 15 pp of edge. This is NOT the same unit as EV cents.
+MIN_PROB_EDGE_PP = 15
+
+# Minimum net EV per contract in cents after fees before an order may be submitted.
+# Matches DecisionEngine.min_edge_cents. Belt-and-suspenders final guard uses this.
+MIN_EV_CENTS = 5
 
 # Per-ticker forecast anchor cache used by the jump compensator.
 # Stores the mu_anc from the previous call so apply_forecast_jump_blend can
@@ -68,12 +74,29 @@ def _ticker_date(ticker: str) -> Optional[str]:
         return None
 
 
+def _ticker_strike(ticker: str) -> Optional[float]:
+    """KXHIGHCHI-26APR29-B54.5 → 54.5  |  KXHIGHCHI-26APR29-T60 → 60.0"""
+    m = _re.search(r"-[BT](\d+(?:\.\d+)?)$", ticker, _re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
 def _tau_to_bin(tau_hrs: float) -> str:
     if tau_hrs < 6:   return "0-6h"
     if tau_hrs < 12:  return "6-12h"
     if tau_hrs < 24:  return "12-24h"
     if tau_hrs < 48:  return "24-48h"
     return "48h+"
+
+
+def _strike_distance_bucket(z: float) -> str:
+    """Map signed strike z-score to distance bucket for calibration reporting."""
+    if math.isnan(z) or math.isinf(z):
+        return "atm"
+    if z > 2.0:   return "far_otm"
+    if z > 0.5:   return "otm"
+    if z > -0.5:  return "atm"
+    if z > -2.0:  return "itm"
+    return "far_itm"
 
 
 def _run_pf_variance(
@@ -123,6 +146,14 @@ def _run_pf_variance(
 
     mu_pf = float(np.sum(pf.weights * pf.particles))
     var_pf = float(np.sum(pf.weights * (pf.particles - mu_pf) ** 2))
+
+    # KXHIGH contracts settle on the daily maximum temperature, not T at resolution
+    # time.  Apply Gumbel correction with the configured mode so this component
+    # is consistent with estimate_p_yes which applies the same scaling.
+    is_daily_max = "KXHIGH" in ticker.upper()
+    if is_daily_max and pf.is_initialized:
+        var_pf = pf.daily_max_var(sigma_intraday=2.0, mode=Config.GUMBEL_MODE)
+
     return max(1.0, var_pf), pf.ess()
 
 
@@ -181,8 +212,10 @@ async def _build_posterior(
     sigma_city = cparams.get("sigma", _FORECAST_SIGMA_F)
     phi_city   = cparams.get("phi",   _AR1_PHI)
 
-    # Independent weather estimate from Open-Meteo using per-city σ and φ
-    p_adj = await estimate_p_yes(ticker, sigma_f=sigma_city, phi=phi_city)
+    # Independent weather estimate from Open-Meteo using per-city σ and φ.
+    # tau_hrs is passed so estimate_p_yes can apply horizon-conditioned σ from
+    # data/sigma_by_horizon.json when that file has been written by calibrate_sigma.py.
+    p_adj = await estimate_p_yes(ticker, sigma_f=sigma_city, phi=phi_city, tau_hrs=tau_hrs)
 
     # Staleness: high when no weather estimate available or near expiry
     pi_stale = 0.1 if p_adj is not None else 0.4
@@ -233,6 +266,8 @@ def _slot_net_qty(db: DWTraderDB, city: str, settle_date: str, env_mode: str) ->
 
 async def trade_cycle(env_mode: str):
     logger.info(f"Starting Trade Cycle [{env_mode}]")
+    logger.info("GUMBEL_MODE=%s cycle_start", Config.GUMBEL_MODE)
+    diag = CycleDiagnostics()
 
     db           = DWTraderDB()
     brain        = LogitJumpDiffusionBrain(sigma_belief=0.3, kappa_mkt=0.3, max_alpha_mkt=0.40)
@@ -242,13 +277,24 @@ async def trade_cycle(env_mode: str):
     trade_logger = TradeLogger(db)
     gating       = TradeGating()
 
+    # Adaptive city risk guard: evaluates rolling Brier per city, sets blocks/throttles.
+    # refresh() queries DB once per cycle; check() is fast (dict lookup).
+    city_guard = CityRiskGuard()
+    city_guard.refresh(db, list(_CITY_MAP.keys()))
+
     current_balance = Config.BANKROLL
+
+    # Rolling Brier over last 7 days — used to penalize Kelly when model is miscalibrated
+    rolling_brier = db.get_rolling_brier(n_days=7)
+    logger.info("Rolling 7-day Brier: %.4f (kelly_mult effective=%.3f)",
+                rolling_brier, max(0.05, 0.25 / (1.0 + 2.0 * rolling_brier)))
 
     markets = await client.get_weather_markets()
     if not markets:
         logger.warning("No weather markets returned. Sleeping.")
         return
 
+    diag.n_scanned = len(markets)
     logger.info(f"Evaluating {len(markets)} weather markets with brain.")
 
     # Load per-city calibrated σ and φ from DB (fast — SQLite only, no I/O).
@@ -272,7 +318,11 @@ async def trade_cycle(env_mode: str):
             continue
         if yes_ask >= 100 and no_ask >= 100:
             continue
+        # Spread filter: wide spread = thin market, high adverse-selection risk
+        if (yes_ask + no_ask - 100) > Config.MAX_SPREAD_CENTS:
+            continue
         valid_markets.append(market)
+    diag.n_spread_ok = len(valid_markets)
 
     # ── Phase 1b: Build posteriors in parallel ────────────────────────────────
     # All _build_posterior() calls fire simultaneously so Open-Meteo fetches for
@@ -302,6 +352,7 @@ async def trade_cycle(env_mode: str):
                     target_date=meta["yesterday"],
                     forecast_temp_f=meta["forecast_yest"],
                     actual_temp_f=meta["actual_yest"],
+                    horizon_hrs=posterior.get("tau_hrs"),
                 )
             ar1_logged.add(city_code)
 
@@ -322,16 +373,25 @@ async def trade_cycle(env_mode: str):
 
         # Skip markets expiring < 6h — weather stations already observed
         if posterior.get("tau_hrs", 99.0) < 6.0:
+            diag.n_tau_skip += 1
             continue
 
         p_yes = posterior.get("P_adj_YES")
         if p_yes is None:
+            diag.n_no_p_yes += 1
             continue
 
         # ── Avellaneda-Stoikov inventory-aware edge threshold ──────────────────
         # Base threshold (15c) is bumped upward when we already hold exposure in
         # the same city/date slot, reducing willingness to add correlated risk.
         city_code = posterior.get("city") or ""
+
+        # City risk guard: skip blocked cities, apply throttle multiplier to qty
+        _city_allowed, _size_mult = city_guard.check(city_code)
+        if not _city_allowed:
+            logger.info("CITY_BLOCKED_GUARD: %s (%s) — skipping", ticker, city_code)
+            continue
+
         tgt_date  = _ticker_date(ticker) or ""
         market_implied_yes = yes_ask / 100.0
         market_implied_no  = 1.0 - no_ask / 100.0
@@ -339,18 +399,58 @@ async def trade_cycle(env_mode: str):
         edge_no   = (market_implied_no - p_yes) * 100
         best_edge = max(edge_yes, edge_no)
 
+        # Calibration diagnostic: log every evaluated market (pre-edge-filter)
+        _preferred_side = "yes" if edge_yes >= edge_no else "no"
+        _strike_z_val = compute_strike_z(ticker, posterior.get("sigma", 4.0))
+        _strike_bucket = _strike_distance_bucket(_strike_z_val)
+        _h_bucket = _tau_to_bin(posterior.get("tau_hrs", 0.0))
+        db.log_calibration_diagnostic(
+            ts=datetime.utcnow().isoformat(),
+            ticker=ticker,
+            city=city_code or None,
+            horizon_bucket=_h_bucket,
+            strike_distance_bucket=_strike_bucket,
+            p_model=float(p_yes),
+            p_market=float(yes_ask / 100.0),
+            edge=float(best_edge),
+            trade_side=None,   # filled in if/when the order submits
+            gumbel_mode=Config.GUMBEL_MODE,
+            env_mode=env_mode,
+        )
+
         q_inv    = _slot_net_qty(db, city_code, tgt_date, env_mode) if city_code and tgt_date else 0
         sigma_p  = math.sqrt(max(1.0, posterior.get("posterior_var_T", 1.0))) / 10.0
         as_adj   = q_inv * 0.10 * sigma_p * posterior.get("tau_hrs", 24.0)
-        min_edge = max(1.0, MIN_EDGE_CENTS + as_adj * 100)
+        min_edge = max(1.0, MIN_PROB_EDGE_PP + as_adj * 100)
 
         if best_edge < min_edge:
+            diag.n_edge_fail += 1
             continue
 
+        if "KXHIGH" in ticker.upper() and logger.isEnabledFor(logging.DEBUG):
+            _var_T = posterior.get("posterior_var_T", 4.0)
+            _p_yes = posterior.get("P_adj_YES", 0.5)
+            logger.debug(
+                "TMAX_CHAIN %s | p_yes=%.4f | var_T=%.3f | sigma_eff=%.4f | "
+                "var_source=%s",
+                ticker, _p_yes, _var_T,
+                0.3 * (max(0.25, _var_T) / 4.0) ** 0.5,   # sigma_eff preview (same formula as logit_jd)
+                "tmax_gumbel" if _var_T > 6.0 else "raw_ou",
+            )
+
+        posterior["rolling_brier"] = rolling_brier
+        # Calibration diagnostic: log P_model vs P_market diff at candidate evaluation
+        _p_market = yes_ask / 100.0
+        _diff = round((p_yes - _p_market) * 100, 1)
+        logger.debug(
+            "CALIB %s | P_model=%.3f P_market=%.3f diff=%+.1fc | city=%s tau=%.1fh",
+            ticker, p_yes, _p_market, _diff, city_code or "?", posterior.get("tau_hrs", 0),
+        )
         intent = engine.evaluate(market, scan_id, current_balance, env_mode, posterior)
         trade_logger.log_decision_step(intent, scan_id, env_mode)
 
         if not intent:
+            diag.n_engine_none += 1
             continue
 
         # ── Full-spectrum Brier: log all edge-filter+engine passers ───────────
@@ -370,6 +470,9 @@ async def trade_cycle(env_mode: str):
             )
 
         intent.target_qty = min(intent.target_qty, TEST_MAX_QTY)
+        # Apply city throttle multiplier (0.5 when Brier is marginal)
+        if _size_mult < 1.0:
+            intent.target_qty = max(1, int(intent.target_qty * _size_mult))
 
         # ── 8-gate filter ─────────────────────────────────────────────────────
         spread    = yes_ask + no_ask - 100
@@ -388,45 +491,121 @@ async def trade_cycle(env_mode: str):
         )
         if not execute_flag:
             logger.debug(f"Gate fail {ticker}: {gate_reasons}")
+            diag.record_gate_fail(gate_reasons)
             continue
 
         if not risk_manager.preflight_check(intent, env_mode):
+            diag.n_risk_fail += 1
             continue
 
         ev = getattr(intent, "expected_value", 0.0)
+        diag.record_candidate(
+            ticker    = ticker,
+            city      = city_code or None,
+            side      = intent.side,
+            p_model   = p_yes,
+            p_market  = yes_ask / 100.0,
+            tau_hrs   = posterior.get("tau_hrs", 0.0),
+            strike_z  = compute_strike_z(ticker, posterior.get("sigma", 4.0)),
+        )
         candidates.append((ev, market, posterior, intent, scan_id))
 
-    # ── Phase 2: Deduplicate — keep best-EV per city+date ────────────────────
-    # One position per city per settlement date eliminates correlated bets
-    # and contradictory exposures (e.g., YES on T71 + NO on B70.5, same city/day).
-    # Also exclude slots we already hold in the DB — prevents re-entry across cycles.
+    # ── Phase 2: Safer dedup — up to 2 same-side positions per city+date slot ──
+    # Rules: max 2 positions per slot | same side only | min 2°F strike sep |
+    #        max 4 total contracts per slot | ranked by EV (best first).
+    _MIN_STRIKE_SEP_F    = 2.0
+    _MAX_POS_PER_SLOT    = 2
+    _MAX_CONTRACTS_SLOT  = 4
+
     open_pos = db.get_open_positions(env_mode)
-    already_held: set = set()
+    _today = datetime.utcnow().date().isoformat()
+
+    # held_slots: slot_key → list of {side, strike, qty}
+    held_slots: Dict[str, List[dict]] = {}
     for pos in open_pos:
         c = _ticker_city(pos["ticker"])
         d = _ticker_date(pos["ticker"])
-        if c and d:
-            already_held.add(f"{c}_{d}")
+        if c and d and d >= _today:
+            held_slots.setdefault(f"{c}_{d}", []).append({
+                "side":   pos["side"],
+                "strike": _ticker_strike(pos["ticker"]),
+                "qty":    pos["qty"],
+            })
 
-    best_per_slot: Dict[str, Candidate] = {}
+    # Sort candidates best-EV first so we always pick the highest-value trade
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # cycle_additions: positions decided this cycle (before any submit)
+    cycle_additions: Dict[str, List[dict]] = {}
+    # best_per_slot: slot_key → list of up to 2 selected candidates
+    best_per_slot: Dict[str, List] = {}
+
     for cand in candidates:
         ev, market, posterior, intent, scan_id = cand
-        city      = posterior.get("city") or "UNK"
-        tgt_date  = _ticker_date(intent.ticker) or "UNK"
-        slot_key  = f"{city}_{tgt_date}"
-        if slot_key in already_held:
-            continue
-        if slot_key not in best_per_slot or ev > best_per_slot[slot_key][0]:
-            best_per_slot[slot_key] = cand
+        city     = posterior.get("city") or "UNK"
+        tgt_date = _ticker_date(intent.ticker) or "UNK"
+        slot_key = f"{city}_{tgt_date}"
+        new_side   = intent.side
+        new_strike = _ticker_strike(intent.ticker)
+        new_qty    = intent.target_qty
 
+        all_in_slot = held_slots.get(slot_key, []) + cycle_additions.get(slot_key, [])
+        n_pos      = len(all_in_slot)
+        total_qty  = sum(p["qty"] for p in all_in_slot)
+
+        # Gate 1: position cap
+        if n_pos >= _MAX_POS_PER_SLOT:
+            diag.n_already_held += 1
+            continue
+
+        # Gate 2: opposite-side block
+        existing_sides = {p["side"] for p in all_in_slot}
+        if existing_sides and new_side not in existing_sides:
+            logger.debug("BLOCKED_OPPOSITE_SIDE: %s new=%s held=%s", slot_key, new_side, existing_sides)
+            diag.n_blocked_opposite_side += 1
+            continue
+
+        # Gate 3: strike too close (minimum 2°F separation)
+        if new_strike is not None:
+            too_close = any(
+                p["strike"] is not None and abs(new_strike - p["strike"]) < _MIN_STRIKE_SEP_F
+                for p in all_in_slot
+            )
+            if too_close:
+                logger.debug(
+                    "BLOCKED_STRIKE_TOO_CLOSE: %s new_strike=%.1f°F",
+                    slot_key, new_strike,
+                )
+                diag.n_blocked_strike_too_close += 1
+                continue
+
+        # Gate 4: contract cap
+        if total_qty + new_qty > _MAX_CONTRACTS_SLOT:
+            logger.debug(
+                "BLOCKED_CITY_DATE_CONTRACT_CAP: %s total=%d+%d > %d",
+                slot_key, total_qty, new_qty, _MAX_CONTRACTS_SLOT,
+            )
+            diag.n_blocked_contract_cap += 1
+            continue
+
+        # Passed — record candidate
+        best_per_slot.setdefault(slot_key, []).append(cand)
+        cycle_additions.setdefault(slot_key, []).append({
+            "side": new_side, "strike": new_strike, "qty": new_qty,
+        })
+
+    _n_final = sum(len(v) for v in best_per_slot.values())
     logger.info(
-        f"Candidates: {len(candidates)} | After city+date dedup: {len(best_per_slot)} unique slots"
-        f" | Already held: {len(already_held)} slots skipped"
+        "PIPELINE: raw_candidates=%d | blocked_already_held=%d | blocked_opposite_side=%d | "
+        "blocked_strike_too_close=%d | blocked_contract_cap=%d | final_executable=%d",
+        len(candidates), diag.n_already_held, diag.n_blocked_opposite_side,
+        diag.n_blocked_strike_too_close, diag.n_blocked_contract_cap, _n_final,
     )
 
     # ── Phase 3: Execute winners ──────────────────────────────────────────────
     trades_taken = 0
-    for slot_key, (ev, market, posterior, intent, scan_id) in best_per_slot.items():
+    for slot_key, slot_cands in best_per_slot.items():
+      for ev, market, posterior, intent, scan_id in slot_cands:
         ticker = intent.ticker
 
         intent_id = trade_logger.log_intent_step(intent, env_mode)
@@ -438,10 +617,60 @@ async def trade_cycle(env_mode: str):
         ))
 
         logger.info(
-            f"INTENT: {ticker} | side={intent.side} | price={intent.price_cents}c "
-            f"| qty={intent.target_qty} | EV={intent.expected_value:.4f} "
-            f"| edge={ev:.2f}c | slot={slot_key}"
+            "INTENT: %s | side=%s | price=%dc | qty=%d | EV=$%.4f | edge_cents=%.2fc | slot=%s",
+            ticker, intent.side, intent.price_cents, intent.target_qty,
+            intent.expected_value, intent.expected_value * 100.0, slot_key,
         )
+
+        # ── Execution invariant — final belt-and-suspenders before hitting exchange ──
+        # 1. EV gate: reject orders whose net EV is below the minimum threshold.
+        _edge_cents = intent.expected_value * 100.0
+        if _edge_cents < MIN_EV_CENTS:
+            logger.warning(
+                "BLOCKED_FINAL_EDGE_GUARD: %s edge=%.2fc < threshold=%.0fc — skipping",
+                ticker, _edge_cents, MIN_EV_CENTS,
+            )
+            continue
+
+        # 2. Stale-ask gate: side-specific ask from the most recent scan must not
+        #    have drifted past our limit price.  (Live check happens inside executor.)
+        _ask_key    = "no_ask" if intent.side == "no" else "yes_ask"
+        _cached_ask = market.get(_ask_key, 0)
+        if _cached_ask > intent.price_cents:
+            logger.warning(
+                "BLOCKED_STALE_DRIFT: %s side=%s cached_%s=%dc > limit=%dc — skipping",
+                ticker, intent.side, _ask_key, _cached_ask, intent.price_cents,
+            )
+            continue
+
+        # 3. Cancel cooldown: if this ticker had 3+ canceled/timed-out orders today,
+        #    blacklist it for the rest of the trading day to avoid churning thin markets.
+        _cancel_count = db.get_canceled_order_count(ticker)
+        if _cancel_count >= 3:
+            logger.warning(
+                "BLOCKED_CANCEL_COOLDOWN: %s — %d canceled attempts today, "
+                "blacklisted until next trading day",
+                ticker, _cancel_count,
+            )
+            continue
+
+        # 4. Already-held re-check: guard against a concurrent cycle opening the
+        #    same slot between our dedup pass and this submit.
+        _fresh_pos = db.get_open_positions(env_mode)
+        _fresh_slot_counts: Dict[str, int] = {}
+        for _fp in _fresh_pos:
+            _fc = _ticker_city(_fp["ticker"])
+            _fd = _ticker_date(_fp["ticker"])
+            if _fc and _fd:
+                _fk = f"{_fc}_{_fd}"
+                _fresh_slot_counts[_fk] = _fresh_slot_counts.get(_fk, 0) + 1
+        if _fresh_slot_counts.get(slot_key, 0) >= 2:
+            logger.warning(
+                "BLOCKED_ALREADY_HELD: %s slot=%s has %d positions (cap=2) — skipping",
+                ticker, slot_key, _fresh_slot_counts[slot_key],
+            )
+            continue
+        # (Daily gross cap was enforced by risk_manager.preflight_check() above.)
 
         try:
             order_result = await executor.execute(intent, client_order_id)
@@ -456,8 +685,20 @@ async def trade_cycle(env_mode: str):
 
         order_db_id = trade_logger.log_order_result(intent, intent_id, ex_order_id, status, env_mode)
 
-        if status == "submitted" and order_data.get("status") == "executed":
-            fill_price = order_data.get("yes_price", intent.price_cents)
+        # Log fill when the inner order is confirmed executed — regardless of the
+        # outer result status, which varies by Kalshi API response shape.
+        if order_data.get("status") == "executed" and order_db_id is not None:
+            _side_price_key = "yes_price" if intent.side == "yes" else "no_price"
+            fill_price = (
+                order_data.get(_side_price_key)
+                or order_data.get("price")
+                or intent.price_cents
+            )
+            fill_price = int(fill_price)
+            yes_ask = market.get("yes_ask", 50)
+            no_ask  = market.get("no_ask", 50)
+            scan_mid = (yes_ask + (100 - no_ask)) // 2
+            fees_c = float(_kalshi_fee_per_contract(fill_price) * intent.target_qty)
             trade_logger.log_execution_fill(
                 order_id=order_db_id,
                 exchange_trade_id=ex_order_id,
@@ -466,11 +707,63 @@ async def trade_cycle(env_mode: str):
                 price=fill_price,
                 qty=intent.target_qty,
                 env_mode=env_mode,
+                scan_mid_cents=scan_mid,
+                predicted_p=posterior.get("P_adj_YES"),
+                market_implied_p=yes_ask / 100.0,
+                city=posterior.get("city"),
+                horizon_bin=_tau_to_bin(posterior.get("tau_hrs", 0.0)),
+                expected_value_cents=intent.expected_value * 100.0,
+                fees_cents=fees_c,
             )
             logger.info(f"FILLED: {ticker} @ {fill_price}c x {intent.target_qty}")
             trades_taken += 1
+            diag.n_fills += 1
+            diag.mark_filled(ticker)
 
-    logger.info(f"Trade Cycle Complete. Filled: {trades_taken} | Unique slots targeted: {len(best_per_slot)}")
+    _n_final = sum(len(v) for v in best_per_slot.values())
+    logger.info(
+        "Trade Cycle Complete. Filled: %d | Unique slots: %d | Orders attempted: %d",
+        trades_taken, len(best_per_slot), _n_final,
+    )
+    report = diag.generate_report(db)
+    logger.info(report)
+
+    # Bias detection: check rolling 7-day P_model - P_market per city
+    _cities_seen = {c.city for c in diag.candidates if c.city}
+    for _city in sorted(_cities_seen):
+        _avg_edge, _n = db.get_city_edge_summary(_city, n_days=7, min_n=20)
+        if _n >= 20:
+            if _avg_edge < -0.05:
+                logger.warning(
+                    "MODEL_NO_BIAS: %s avg_edge=%.3f n=%d (last 7d) — model systematically short",
+                    _city, _avg_edge, _n,
+                )
+            elif _avg_edge > 0.05:
+                logger.warning(
+                    "MODEL_YES_BIAS: %s avg_edge=%.3f n=%d (last 7d) — model systematically long",
+                    _city, _avg_edge, _n,
+                )
+
+    # Experiment run log: one summary row per cycle date+gumbel_mode
+    try:
+        _run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        _yes_fills = sum(1 for c in diag.candidates if c.filled and c.side == "yes")
+        _no_fills  = sum(1 for c in diag.candidates if c.filled and c.side == "no")
+        _rolling_brier = db.get_rolling_brier(n_days=7)
+        db.upsert_experiment_run(
+            run_date=_run_date,
+            gumbel_mode=Config.GUMBEL_MODE,
+            total_trades=diag.n_fills,
+            yes_trades=_yes_fills,
+            no_trades=_no_fills,
+            avg_edge_cents=None,   # populated by calibration_report.py offline
+            avg_lvr_cents=None,
+            realized_pnl_cents=None,
+            brier_score=_rolling_brier,
+            n_settled=0,           # populated by check_outcomes.py
+        )
+    except Exception as _e:
+        logger.error("EXPERIMENT_RUN_LOG_FAILED: %s", _e)
 
 
 async def monitor_positions(env_mode: str) -> int:
@@ -507,8 +800,13 @@ async def monitor_positions(env_mode: str) -> int:
             logger.debug("monitor: no market data for %s — skipping", ticker)
             continue
 
-        # Skip already-settled markets (settlement handled by check_outcomes.py)
+        # If Kalshi says the market is closed/settled, write realized P&L and mark settled
         if market.get("status") in ("settled", "closed", "finalized"):
+            result_side = market.get("result")
+            if result_side in ("yes", "no"):
+                db.settle_position_with_outcome(ticker, yes_won=(result_side == "yes"))
+            else:
+                db.mark_position_settled(ticker)
             continue
 
         # Current bid for our side = best price someone will buy our contracts at
@@ -531,6 +829,11 @@ async def monitor_positions(env_mode: str) -> int:
                 tau_hrs = max(0.0, (dt - datetime.now(timezone.utc)).total_seconds() / 3600.0)
             except Exception:
                 pass
+
+        # Market has already expired — let Kalshi settle it; don't try to sell
+        if tau_hrs == 0.0:
+            db.mark_position_settled(ticker)
+            continue
 
         pnl_pct = (current_bid - avg_cost) / avg_cost if avg_cost > 0 else 0.0
 
@@ -615,6 +918,7 @@ async def monitor_positions(env_mode: str) -> int:
             order_type="sell",
             status="submitted",
             environment=env_mode,
+            gumbel_mode=Config.GUMBEL_MODE,
         )
         if order_db_id:
             db.log_execution_record(

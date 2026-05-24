@@ -7,8 +7,9 @@ CLAUDE.local.md
 Credentials/
 src/settings/
 
-# Database (large binary, tracked separately if needed)
+# Database and runtime state
 data/DWTrader.db
+data/city_blocks.json
 # Stale nested copy from TEOFITS parent repo
 kalshi-bot-python/
 data/DWTrader.db-wal

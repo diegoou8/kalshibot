@@ -8,6 +8,7 @@ Usage:
     python scripts/calibrate_sigma.py
     python scripts/calibrate_sigma.py --min-days 30
 """
+import json
 import math
 import sys
 import argparse
@@ -17,6 +18,18 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.db.dwtrader import DWTraderDB
+
+_SIGMA_BY_HORIZON_PATH = Path(__file__).resolve().parents[1] / "data" / "sigma_by_horizon.json"
+
+_ALL_BINS = ["0-6h", "6-12h", "12-24h", "24-48h", "48h+"]
+
+
+def _tau_to_bin(tau_hrs: float) -> str:
+    if tau_hrs < 6:   return "0-6h"
+    if tau_hrs < 12:  return "6-12h"
+    if tau_hrs < 24:  return "12-24h"
+    if tau_hrs < 48:  return "24-48h"
+    return "48h+"
 
 
 def _mle_sigma(errors: list) -> float:
@@ -70,6 +83,19 @@ def _ar1_residuals(db: DWTraderDB):
     return dict(by_city)
 
 
+def _horizon_residuals(db: DWTraderDB):
+    """Return errors grouped by horizon bin for rows where horizon_hrs IS NOT NULL."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT horizon_hrs, error_f FROM ar1_residuals WHERE horizon_hrs IS NOT NULL"
+        ).fetchall()
+    by_bin = defaultdict(list)
+    for r in rows:
+        bin_name = _tau_to_bin(r["horizon_hrs"])
+        by_bin[bin_name].append(r["error_f"])
+    return dict(by_bin)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-days", type=int, default=14,
@@ -113,6 +139,28 @@ def main():
         delta = sigma - 4.0
         flag = "^ underestimated" if delta > 0.5 else ("v overestimated" if delta < -0.5 else "~ calibrated")
         print(f"  {city:<10} {len(errors):>9}  {sigma:>12.2f}  {qlike_mle:>11.4f}  {qlike_current:>11.4f}  {flag}")
+
+    # -- sigma by horizon bin ------------------------------------------
+    print("\n-- sigma MLE by horizon bin (horizon_hrs-conditioned) --")
+    print(f"  {'Bin':<10} {'N errors':>9}  {'sigma MLE (F)':>12}  Status")
+    print(f"  {'-'*50}")
+    horizon_data = _horizon_residuals(db)
+    sigma_by_horizon: dict = {}
+    for bin_name in _ALL_BINS:
+        errors = horizon_data.get(bin_name, [])
+        if len(errors) < 5:
+            status = f"need >=5 (have {len(errors)})"
+            print(f"  {bin_name:<10} {len(errors):>9}  {'n/a':>12}  {status}")
+        else:
+            sigma = _mle_sigma(errors)
+            sigma_by_horizon[bin_name] = round(sigma, 4)
+            print(f"  {bin_name:<10} {len(errors):>9}  {sigma:>12.2f}  OK")
+    if sigma_by_horizon:
+        _SIGMA_BY_HORIZON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SIGMA_BY_HORIZON_PATH.write_text(json.dumps(sigma_by_horizon, indent=2))
+        print(f"\n  Written: {_SIGMA_BY_HORIZON_PATH}")
+    else:
+        print(f"\n  Not enough data to write {_SIGMA_BY_HORIZON_PATH} — run more trade cycles first.")
 
     # -- Brier scores --------------------------------------------------
     print("\n-- Brier scores by city / horizon --")

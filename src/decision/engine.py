@@ -36,7 +36,7 @@ class DecisionEngine:
         brain=None,
         max_kelly_fraction: float = 0.15,
         kelly_multiplier: float = 1.0,
-        min_edge_cents: float = 2.0,   # minimum net EV per contract to fire
+        min_edge_cents: float = 5.0,   # minimum net EV per contract to fire
         min_total_ev: float = 3.0,     # minimum total EV (cents) across the order
     ):
         self.brain = brain
@@ -111,6 +111,15 @@ class DecisionEngine:
 
         p_no = 1.0 - p_yes
 
+        # ── Brier-penalized Kelly multiplier ─────────────────────────────────
+        # When rolling_brier is high the model is poorly calibrated — shrink sizing.
+        # effective_mult = base / (1 + 2 * brier). At brier=0.28: 0.25/1.56=0.16.
+        # At brier=0.04 (good): 0.25/1.08=0.23. Floor at 0.05 to keep trades alive.
+        rolling_brier = posterior_data.get("rolling_brier", 0.25)
+        effective_mult = max(0.05, self.kelly_multiplier / (1.0 + 2.0 * rolling_brier))
+        saved_mult = self.kelly_multiplier
+        self.kelly_multiplier = effective_mult
+
         # ── Evaluate YES side ─────────────────────────────────────────────────
         fee_yes = _kalshi_fee_per_contract(yes_ask)
         ev_yes_per_contract = p_yes * 100.0 - yes_ask - fee_yes
@@ -131,6 +140,8 @@ class DecisionEngine:
             if qty > 0 and ev_no_per_contract * qty >= self.min_total_ev:
                 best_side, best_ev, best_price, best_prob = "no", ev_no_per_contract, no_ask, p_no
                 best_kelly, best_qty = kelly, qty
+
+        self.kelly_multiplier = saved_mult
 
         if best_side is None:
             return None

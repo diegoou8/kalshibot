@@ -125,6 +125,10 @@ class LogitJumpDiffusionBrain:
             * math.tanh(x_post / 2.0)
             * min(tau_hrs, 24.0) / 24.0
         )
+        logger.debug(
+            "LOGITJD_SIGMA %s | var_T=%.3f | sigma_eff=%.4f | drift=%.6f",
+            posterior.get("ticker", "?"), var_T, sigma_eff, rn_drift
+        )
         x_post += rn_drift
 
         # ── Step 6: Staleness penalty ─────────────────────────────────────────

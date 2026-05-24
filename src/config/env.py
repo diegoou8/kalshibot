@@ -31,6 +31,20 @@ class Config:
     DAILY_VOLUME_LIMIT = float(os.getenv("DAILY_VOLUME_LIMIT", "5000.0"))
     DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "250.0"))
 
+    # Gumbel T_max correction mode for daily-max (KXHIGH) contracts.
+    # "none"  — no correction; uses raw point-temperature σ
+    # "half"  — applies 50% of the Gumbel additive variance term (recommended)
+    # "full"  — applies full Gumbel correction (π²/6 × σ_intraday²)
+    GUMBEL_MODE: str = os.getenv("GUMBEL_MODE", "half")
+
+    # Max total open contracts (any side) across all tickers settling on the same date.
+    # Prevents correlated concentration even across cities.
+    MAX_DAILY_GROSS_CONTRACTS: int = int(os.getenv("MAX_DAILY_GROSS_CONTRACTS", "10"))
+
+    # Maximum spread (yes_ask + no_ask - 100) in cents to allow entry.
+    # Wide spreads signal thin markets with high adverse-selection risk.
+    MAX_SPREAD_CENTS: int = int(os.getenv("MAX_SPREAD_CENTS", "15"))
+
     # City Coordinates for Weather Ingestion
     CITY_COORDS = {
         "NEW YORK": (40.7128, -74.0060), "NYC": (40.7128, -74.0060),

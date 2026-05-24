@@ -35,22 +35,26 @@ class ExecutionManager:
         )
 
         # ── Pre-flight depth check ────────────────────────────────────────────
+        # Use the side-specific ask: no_asks for NO orders, yes_asks for YES orders.
         ob = await self.client.get_order_book(intent.ticker)
         best_ask = 100
-        yes_asks = ob.get("yes_asks", []) or ob.get("asks", [])
-        if yes_asks and isinstance(yes_asks, list):
+        if intent.side == "no":
+            raw_asks = ob.get("no_asks", []) or ob.get("no", [])
+        else:
+            raw_asks = ob.get("yes_asks", []) or ob.get("asks", [])
+        if raw_asks and isinstance(raw_asks, list):
             try:
-                clean = [(int(p), int(q)) for p, q in yes_asks
+                clean = [(int(p), int(q)) for p, q in raw_asks
                          if isinstance(p, (int, str)) and isinstance(q, (int, str))]
                 if clean:
                     best_ask = min(p for p, q in clean)
             except Exception as exc:
-                logger.warning("Failed to parse orderbook asks: %s | %s", yes_asks, exc)
+                logger.warning("Failed to parse orderbook asks: %s | %s", raw_asks, exc)
 
         if best_ask > intent.price_cents:
             logger.warning(
-                "⚠️ Price Drift: Best Ask %dc > Limit %dc. Order may rest.",
-                best_ask, intent.price_cents,
+                "⚠️ Price Drift (%s): Best Ask %dc > Limit %dc. Order may rest.",
+                intent.side.upper(), best_ask, intent.price_cents,
             )
 
         # ── Submit ────────────────────────────────────────────────────────────

@@ -9,11 +9,13 @@ Supported ticker formats:
   KXHIGH{CITY}-{YYMMMDD}-T{THRESH}    daily high above/below threshold
   KXTEMP{CITY}-{YYMMMDD}{HH}-T{THRESH} hourly temp above threshold
 """
+import json
 import math
 import re
 import logging
 import asyncio
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import aiohttp
@@ -57,10 +59,40 @@ _STUDENT_T_DF = 7
 # Estimated from historical residuals; 0.4 is a reasonable NWP starting point.
 _AR1_PHI = 0.4
 
+_SIGMA_BY_HORIZON_PATH = Path(__file__).resolve().parents[2] / "data" / "sigma_by_horizon.json"
+
 # Cache: cache_key → (forecast_temp_f, date_fetched)
 _forecast_cache: Dict[str, float] = {}
 # AR(1) metadata cache: "ar1:{lat},{lon}" → {correction, e_prev, actual_yest, forecast_yest}
 _ar1_error_cache: Dict[str, Dict] = {}
+
+# Adaptive bias filter — module-level singleton so state persists across calls
+# within a process lifetime. Starts cold (bias=0 for all cities).
+from src.brain.bias_filter import AdaptiveBiasFilter as _AdaptiveBiasFilter
+_adaptive_bias = _AdaptiveBiasFilter(k_base=0.3, k_max=0.7, window=5)
+
+# Reverse lookup: "lat,lon" → city code, derived from _CITY_MAP.
+# Built once at module load; used by _fetch_ar1_correction and estimate_p_yes.
+_LAT_LON_TO_CITY: Dict[str, str] = {
+    f"{lat:.3f},{lon:.3f}": city
+    for city, (lat, lon, _tz) in _CITY_MAP.items()
+}
+
+
+def _tau_to_bin(tau_hrs: float) -> str:
+    if tau_hrs < 6:   return "0-6h"
+    if tau_hrs < 12:  return "6-12h"
+    if tau_hrs < 24:  return "12-24h"
+    if tau_hrs < 48:  return "24-48h"
+    return "48h+"
+
+
+def load_horizon_sigma(path: str = str(_SIGMA_BY_HORIZON_PATH)) -> Dict[str, float]:
+    """Load per-horizon-bin σ from JSON file. Returns {} if file does not exist."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
 def _p_above(forecast_temp: float, threshold: float, sigma: float = _FORECAST_SIGMA_F) -> float:
@@ -72,7 +104,13 @@ def _p_above(forecast_temp: float, threshold: float, sigma: float = _FORECAST_SI
     # = P(forecast + sigma*T_7 > threshold) = P(T_7 > z) = sf(z)
     z = (threshold - forecast_temp) / sigma
     p = float(_student_t.sf(z, df=_STUDENT_T_DF))
-    return max(0.01, min(0.99, p))
+    clamped = max(0.03, min(0.97, p))
+    if clamped != p:
+        logger.debug(
+            "PROB_CLAMP: raw=%.5f → %.3f (threshold=%.1f, forecast=%.1f, sigma=%.2f)",
+            p, clamped, threshold, forecast_temp, sigma,
+        )
+    return clamped
 
 
 def _parse_ticker(ticker: str) -> Optional[Dict]:
@@ -251,6 +289,12 @@ async def _fetch_ar1_correction(lat: float, lon: float, tz: str) -> float:
     }
     logger.debug("AR(1) correction for (%.3f,%.3f): actual=%.1f forecast=%.1f e=%.1f corr=%.2f",
                  lat, lon, actual_yest, forecast_yest, e_prev, correction)
+
+    # Feed the new observation into the adaptive bias filter.
+    city_code = _LAT_LON_TO_CITY.get(f"{lat:.3f},{lon:.3f}")
+    if city_code is not None:
+        _adaptive_bias.update(city_code, actual_yest, forecast_yest)
+
     return correction
 
 
@@ -307,13 +351,17 @@ async def estimate_p_yes(
     ticker: str,
     sigma_f: Optional[float] = None,
     phi: Optional[float] = None,
+    tau_hrs: Optional[float] = None,
 ) -> Optional[float]:
     """
     Returns P(YES settles) for a Kalshi weather market based on Open-Meteo forecast.
     Returns None if the ticker format is unrecognised or the city is unmapped.
 
-    sigma_f: forecast uncertainty (°F). Uses per-city MLE when provided, else _FORECAST_SIGMA_F.
-    phi:     AR(1) coefficient. Uses per-city OLS when provided, else _AR1_PHI.
+    sigma_f:  forecast uncertainty (°F). Uses per-city MLE when provided, else _FORECAST_SIGMA_F.
+    phi:      AR(1) coefficient. Uses per-city OLS when provided, else _AR1_PHI.
+    tau_hrs:  hours to settlement; used to look up horizon-conditioned σ from
+              data/sigma_by_horizon.json. When the file exists, its σ overrides sigma_f
+              for the matching horizon bin, falling back to sigma_f when the bin is absent.
     """
     parsed = _parse_ticker(ticker)
     if not parsed:
@@ -328,7 +376,12 @@ async def estimate_p_yes(
     if not iso_date:
         return None
 
-    sigma_use = sigma_f if sigma_f is not None else _FORECAST_SIGMA_F
+    _horizon_sigma = load_horizon_sigma()
+    if tau_hrs is not None and _horizon_sigma:
+        tau_bin = _tau_to_bin(tau_hrs)
+        sigma_use = _horizon_sigma.get(tau_bin, sigma_f if sigma_f is not None else _FORECAST_SIGMA_F)
+    else:
+        sigma_use = sigma_f if sigma_f is not None else _FORECAST_SIGMA_F
     phi_use   = phi     if phi     is not None else _AR1_PHI
 
     mtype = parsed["type"]
@@ -338,17 +391,35 @@ async def estimate_p_yes(
     cache_key = f"ar1:{lat:.3f},{lon:.3f}"
     meta = _ar1_error_cache.get(cache_key)
     e_prev = meta["e_prev"] if meta else 0.0
-    ar1 = phi_use * e_prev
+    city_code = _LAT_LON_TO_CITY.get(f"{lat:.3f},{lon:.3f}")
+    ar1 = _adaptive_bias.correction(city_code) if city_code else phi_use * e_prev
+
+    if mtype in ("HIGH_BAND", "HIGH_ABOVE"):
+        # KXHIGH settles on the daily maximum temperature, not a point-in-time reading.
+        # Apply the same Gumbel σ correction used by the particle filter so that the
+        # probability estimate and the gating variance are consistent.
+        from src.config.env import Config as _Cfg
+        _gumbel_mode = getattr(_Cfg, "GUMBEL_MODE", "half")
+        _sigma_intraday = 2.0
+        if _gumbel_mode != "none":
+            _scale = 0.5 if _gumbel_mode == "half" else 1.0
+            _sigma_eff = _sigma_intraday * _scale
+            _gumbel_std = _sigma_eff * math.pi / math.sqrt(6)
+            sigma_use = math.sqrt(sigma_use ** 2 + _gumbel_std ** 2)
+        logger.debug("T_max sigma: %.3f°F (gumbel_mode=%s)", sigma_use, _gumbel_mode)
 
     if mtype == "HIGH_BAND":
         temp = await _fetch_daily_max(lat, lon, tz, iso_date)
         if temp is None:
             return None
         temp_adj = temp + ar1
-        # P(lower ≤ T < upper) ≈ P(T > lower) - P(T > upper)
         p_above_lower = _p_above(temp_adj, parsed["lower"], sigma_use)
         p_above_upper = _p_above(temp_adj, parsed["upper"], sigma_use)
-        return float(max(0.01, min(0.99, p_above_lower - p_above_upper)))
+        p_band = p_above_lower - p_above_upper
+        clamped = max(0.03, min(0.97, p_band))
+        if clamped != p_band:
+            logger.debug("PROB_CLAMP_BAND %s: raw=%.5f → %.3f", ticker, p_band, clamped)
+        return float(clamped)
 
     elif mtype == "HIGH_ABOVE":
         temp = await _fetch_daily_max(lat, lon, tz, iso_date)
