@@ -9,6 +9,9 @@ Single-container entry point — all tasks run in one asyncio event loop:
 Historical weather bootstrap runs once at startup if the DB is empty.
 The halt flag pauses trade_cycle and monitor_positions immediately.
 """
+import sys
+print("=== BOT_RUNNER PROCESS STARTED ===", flush=True)
+
 import asyncio
 import logging
 import os
@@ -28,6 +31,7 @@ from src.services.kalshi_client import client
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("BotRunner")
 

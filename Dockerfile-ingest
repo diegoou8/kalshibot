@@ -20,4 +20,4 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
-CMD ["python", "-u", "bot_runner.py"]
+CMD ["sh", "-c", "python -u bot_runner.py 2>&1"]
