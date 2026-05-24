@@ -1,0 +1,70 @@
+name: Build and Deploy to Azure Web App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+env:
+  IMAGE: ghcr.io/diegoou8/kalshibot
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # push to ghcr.io
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 1. Build & push image to GitHub Container Registry ─────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile-ingest
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      # ── 2. Deploy to Azure Web App ──────────────────────────────────────────
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update container image + registry credentials
+        run: |
+          az webapp config container set \
+            --name KBot \
+            --resource-group bot \
+            --container-image-name ${{ env.IMAGE }}:${{ github.sha }} \
+            --container-registry-url https://ghcr.io \
+            --container-registry-user diegoou8 \
+            --container-registry-password ${{ secrets.GHCR_PAT }}
+
+      - name: Sync environment variables to Web App
+        run: |
+          az webapp config appsettings set \
+            --name KBot \
+            --resource-group bot \
+            --settings \
+              AZURE_SQL_CONN_STR="${{ secrets.AZURE_SQL_CONN_STR }}" \
+              KALSHI_DEMO_KEY_ID="${{ secrets.KALSHI_DEMO_KEY_ID }}" \
+              ENV_EXECUTION_MODE="PAPER" \
+              GUMBEL_MODE="half" \
+              TRADE_CYCLE_INTERVAL_SECS="300" \
+              MONITOR_INTERVAL_SECS="120" \
+              TZ="America/Chicago"
+
+      - name: Restart Web App
+        run: az webapp restart --name KBot --resource-group bot
