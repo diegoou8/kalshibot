@@ -26,7 +26,7 @@ except ImportError:
     pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bot_runner import GUMBEL_SCHEDULE  # single source of truth for the schedule
+from src.config.experiment import GUMBEL_SCHEDULE  # single source of truth
 
 _VALID_MODES = ("none", "half", "full")
 

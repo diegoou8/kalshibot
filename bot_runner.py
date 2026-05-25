@@ -10,8 +10,6 @@ Historical weather bootstrap runs once at startup if the DB is empty.
 The halt flag pauses trade_cycle and monitor_positions immediately.
 """
 import sys
-print("=== BOT_RUNNER PROCESS STARTED ===", flush=True)
-
 import asyncio
 import logging
 import os
@@ -27,6 +25,7 @@ from src.config.env import Config
 from src.db.dwtrader import DWTraderDB
 from src.db.maintenance import prune as _db_prune
 from src.services.kalshi_client import client
+from src.config.experiment import GUMBEL_SCHEDULE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,16 +42,7 @@ TRADE_CYCLE_INTERVAL = int(os.getenv("TRADE_CYCLE_INTERVAL_SECS", "300"))
 MONITOR_INTERVAL     = int(os.getenv("MONITOR_INTERVAL_SECS", "120"))
 PRUNE_HOUR_UTC       = int(os.getenv("PRUNE_HOUR_UTC", "4"))   # 4am UTC = after all settlements
 INNER_SLEEP          = 10   # main-loop polling resolution (seconds)
-
-# Gumbel A/B/C experiment schedule (UTC date → mode).
-# Add future rows here — the bot auto-applies them at midnight UTC with no manual step.
-GUMBEL_SCHEDULE: Dict[str, str] = {
-    "2026-04-28": "half",
-    "2026-04-29": "none",
-    "2026-04-30": "full",
-    "2026-05-04": "none",
-    "2026-05-05": "none",
-}
+# GUMBEL_SCHEDULE is imported from src/config/experiment.py — edit there to add dates.
 
 
 def _env_mode() -> str:
@@ -119,6 +109,7 @@ async def _run_weather_loop(db: DWTraderDB) -> None:
 
 
 async def run() -> None:
+    print("=== BOT_RUNNER PROCESS STARTED ===", flush=True)
     env_mode = _env_mode()
     logger.info(
         "BotRunner starting | env=%s | trade_interval=%ds | monitor_interval=%ds",
@@ -170,9 +161,11 @@ async def run() -> None:
         now     = time.monotonic()
         now_utc = datetime.now(timezone.utc)
 
-        # ── Gumbel experiment auto-schedule (once per UTC day) ────────────────
+        # ── Gumbel experiment auto-schedule ──────────────────────────────────
+        # Fires at PRUNE_HOUR_UTC (4 AM UTC = midnight US Eastern, after all
+        # daily temp-market settlements) — same "end of day" gate as the DB prune.
         today_str = now_utc.strftime("%Y-%m-%d")
-        if today_str != last_gumbel_date:
+        if now_utc.hour == PRUNE_HOUR_UTC and today_str != last_gumbel_date:
             last_gumbel_date = today_str
             sched_mode = GUMBEL_SCHEDULE.get(today_str)
             if sched_mode:
@@ -180,7 +173,7 @@ async def run() -> None:
                     _db.set_config("GUMBEL_MODE", sched_mode)
                     if Config.GUMBEL_MODE != sched_mode:
                         logger.info(
-                            "Gumbel auto-schedule: %s -> %s for %s",
+                            "Gumbel auto-schedule: %s -> %s for %s (4AM UTC)",
                             Config.GUMBEL_MODE, sched_mode, today_str,
                         )
                         Config.GUMBEL_MODE = sched_mode
