@@ -366,5 +366,40 @@ class KalshiClient:
             logger.debug("cancel_order failed: %s", e)
         return False
 
+    async def get_portfolio_positions(self) -> List[Dict[str, Any]]:
+        """Return all current positions from /portfolio/positions."""
+        path_suffix = "/portfolio/positions"
+        url = f"{Config.BASE_URL}{path_suffix}"
+        signing_path = f"/trade-api/v2{path_suffix}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = self._get_headers("GET", signing_path)
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("market_positions", data.get("positions", []))
+                    logger.error("get_portfolio_positions %s: %s", resp.status, await resp.text())
+        except Exception as e:
+            logger.error("get_portfolio_positions failed: %s", e)
+        return []
+
+    async def get_portfolio_fills(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Return recent fills from /portfolio/fills."""
+        path_suffix = f"/portfolio/fills?limit={limit}"
+        url = f"{Config.BASE_URL}{path_suffix}"
+        signing_path = f"/trade-api/v2/portfolio/fills"
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = self._get_headers("GET", signing_path)
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("fills", [])
+                    logger.error("get_portfolio_fills %s: %s", resp.status, await resp.text())
+        except Exception as e:
+            logger.error("get_portfolio_fills failed: %s", e)
+        return []
+
+
 # Export an instance
 client = KalshiClient()

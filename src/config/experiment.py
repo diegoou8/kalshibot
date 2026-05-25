@@ -21,6 +21,7 @@ GUMBEL_SCHEDULE: Dict[str, str] = {
     # ── Phase 2 (May–Jun 2026) ────────────────────────────────────────────────
     # 3 days per mode gives enough trades to compare edge/Brier/PnL across modes.
     # After each 9-day block, run: python analytics/calibration_report.py --days 9
+    # 2026-05-25: excluded — fill-tracking bug caused 162 contracts over-bought before fix deploy
     "2026-05-25": "half",
     "2026-05-26": "half",
     "2026-05-27": "half",

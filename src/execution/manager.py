@@ -81,7 +81,7 @@ class ExecutionManager:
             return result
 
         # ── Poll for fill ─────────────────────────────────────────────────────
-        if order_id and order_data.get("status") in ("resting", "pending", "open"):
+        if order_id and order_data.get("status") not in (None, "", "executed", "canceled"):
             logger.info(
                 "📡 Order %s resting — polling for fill (timeout %ds)...",
                 order_id, _POLL_TIMEOUT_S,
@@ -159,7 +159,7 @@ class ExecutionManager:
             logger.info("📤 SOLD %s immediately @ %dc", ticker, bid_cents)
             return result
 
-        if order_id and order_data.get("status") in ("resting", "pending", "open"):
+        if order_id and order_data.get("status") not in (None, "", "executed", "canceled"):
             logger.info(
                 "📤 Sell order %s resting — polling (timeout %ds)...",
                 order_id, _POLL_TIMEOUT_S,
