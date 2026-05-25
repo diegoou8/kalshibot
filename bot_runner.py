@@ -18,7 +18,7 @@ import os
 import time
 from datetime import datetime, timezone, date as _date
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from aiohttp import web
 from src.index import trade_cycle, monitor_positions
@@ -43,6 +43,16 @@ TRADE_CYCLE_INTERVAL = int(os.getenv("TRADE_CYCLE_INTERVAL_SECS", "300"))
 MONITOR_INTERVAL     = int(os.getenv("MONITOR_INTERVAL_SECS", "120"))
 PRUNE_HOUR_UTC       = int(os.getenv("PRUNE_HOUR_UTC", "4"))   # 4am UTC = after all settlements
 INNER_SLEEP          = 10   # main-loop polling resolution (seconds)
+
+# Gumbel A/B/C experiment schedule (UTC date → mode).
+# Add future rows here — the bot auto-applies them at midnight UTC with no manual step.
+GUMBEL_SCHEDULE: Dict[str, str] = {
+    "2026-04-28": "half",
+    "2026-04-29": "none",
+    "2026-04-30": "full",
+    "2026-05-04": "none",
+    "2026-05-05": "none",
+}
 
 
 def _env_mode() -> str:
@@ -139,6 +149,7 @@ async def run() -> None:
     last_trade   = 0.0
     last_monitor = 0.0
     last_prune_date: Optional[_date] = None
+    last_gumbel_date: Optional[str] = None
 
     while True:
         # ── Halt check ────────────────────────────────────────────────────────
@@ -156,7 +167,25 @@ async def run() -> None:
             logger.warning("WebSocket task ended (exc=%s) — restarting", exc)
             ws_task = _make_ws_task(pipeline, ws_url)
 
-        now = time.monotonic()
+        now     = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+
+        # ── Gumbel experiment auto-schedule (once per UTC day) ────────────────
+        today_str = now_utc.strftime("%Y-%m-%d")
+        if today_str != last_gumbel_date:
+            last_gumbel_date = today_str
+            sched_mode = GUMBEL_SCHEDULE.get(today_str)
+            if sched_mode:
+                try:
+                    _db.set_config("GUMBEL_MODE", sched_mode)
+                    if Config.GUMBEL_MODE != sched_mode:
+                        logger.info(
+                            "Gumbel auto-schedule: %s -> %s for %s",
+                            Config.GUMBEL_MODE, sched_mode, today_str,
+                        )
+                        Config.GUMBEL_MODE = sched_mode
+                except Exception as exc:
+                    logger.error("Gumbel auto-schedule failed: %s", exc)
 
         # ── Position monitor (every 2 min) ────────────────────────────────────
         if now - last_monitor >= MONITOR_INTERVAL:
@@ -170,17 +199,6 @@ async def run() -> None:
 
         # ── Trade cycle (every 5 min) ─────────────────────────────────────────
         if now - last_trade >= TRADE_CYCLE_INTERVAL:
-            # Hot-swap GUMBEL_MODE from DB (no restart needed)
-            try:
-                db_mode = _db.get_config("GUMBEL_MODE")
-                if db_mode and db_mode != Config.GUMBEL_MODE:
-                    logger.info(
-                        "GUMBEL_MODE hot-swap: %s -> %s (from bot_config)",
-                        Config.GUMBEL_MODE, db_mode,
-                    )
-                    Config.GUMBEL_MODE = db_mode
-            except Exception as exc:
-                logger.warning("GUMBEL_MODE hot-swap check failed: %s", exc)
             try:
                 await trade_cycle(env_mode)
             except Exception as exc:
@@ -188,7 +206,6 @@ async def run() -> None:
             last_trade = time.monotonic()
 
         # ── Nightly DB prune (once per day at PRUNE_HOUR_UTC) ─────────────────
-        now_utc = datetime.now(timezone.utc)
         if now_utc.hour == PRUNE_HOUR_UTC and now_utc.date() != last_prune_date:
             logger.info("Starting nightly DB prune (PRUNE_HOUR_UTC=%d)...", PRUNE_HOUR_UTC)
             try:
