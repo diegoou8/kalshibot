@@ -259,8 +259,9 @@ def _slot_net_qty(db: DWTraderDB, city: str, settle_date: str, env_mode: str) ->
         ).fetchall()
     net = 0
     for r in rows:
-        if _ticker_city(r["ticker"]) == city and _ticker_date(r["ticker"]) == settle_date:
-            net += r["qty"] if r["side"] == "yes" else -r["qty"]
+        r_ticker, r_side, r_qty = r[0], r[1], int(r[2])
+        if _ticker_city(r_ticker) == city and _ticker_date(r_ticker) == settle_date:
+            net += r_qty if r_side == "yes" else -r_qty
     return net
 
 
