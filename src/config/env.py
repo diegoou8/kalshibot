@@ -10,9 +10,12 @@ class Config:
     # Kalshi Demo Credentials
     KALSHI_DEMO_KEY_ID = os.getenv("KALSHI_DEMO_KEY_ID", "44e84c19-3ea5-4b91-aaeb-b97bae8ab615")
     
-    # Path to your Demo Key
+    # Path to your Demo Key (used locally; in Azure the key content comes from KALSHI_DEMO_PRIVATE_KEY)
     _default_demo_key_path = Path(__file__).resolve().parent.parent.parent / "Credentials" / "DiegoDemoKey.txt"
     KALSHI_DEMO_KEY_FILE_PATH = _default_demo_key_path
+
+    # PEM key content injected directly as an env var in Azure (avoids mounting a secret file)
+    KALSHI_DEMO_PRIVATE_KEY: str = os.getenv("KALSHI_DEMO_PRIVATE_KEY", "")
 
     # Execution mode: PAPER (demo API) or LIVE (live API).
     # Always uppercase so DB CHECK constraints and comparisons are consistent.

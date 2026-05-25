@@ -21,13 +21,35 @@ class KalshiClient:
         self._load_private_key()
 
     def _load_private_key(self):
+        # 1. Try file (local dev)
         try:
             with open(Config.KALSHI_DEMO_KEY_FILE_PATH, "rb") as key_file:
                 self._private_key = serialization.load_pem_private_key(
                     key_file.read(), password=None
                 )
+            return
+        except FileNotFoundError:
+            pass
         except Exception as e:
-            logger.error(f"Failed to load RSA Key from File {Config.KALSHI_DEMO_KEY_FILE_PATH}: {e}")
+            logger.error("Failed to load RSA key from file %s: %s", Config.KALSHI_DEMO_KEY_FILE_PATH, e)
+            return
+
+        # 2. Fall back to env var (Azure / CI)
+        pem = Config.KALSHI_DEMO_PRIVATE_KEY
+        if pem:
+            try:
+                self._private_key = serialization.load_pem_private_key(
+                    pem.encode(), password=None
+                )
+                logger.info("Loaded RSA private key from KALSHI_DEMO_PRIVATE_KEY env var.")
+            except Exception as e:
+                logger.error("Failed to load RSA key from KALSHI_DEMO_PRIVATE_KEY env var: %s", e)
+        else:
+            logger.error(
+                "No RSA private key available: file not found at %s and "
+                "KALSHI_DEMO_PRIVATE_KEY env var is not set.",
+                Config.KALSHI_DEMO_KEY_FILE_PATH,
+            )
 
     def _sign_request(self, method: str, path: str, timestamp: str) -> str:
         if not self._private_key:

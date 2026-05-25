@@ -51,6 +51,7 @@ jobs:
             --settings \
               AZURE_SQL_CONN_STR="${{ secrets.AZURE_SQL_CONN_STR }}" \
               KALSHI_DEMO_KEY_ID="${{ secrets.KALSHI_DEMO_KEY_ID }}" \
+              KALSHI_DEMO_PRIVATE_KEY="${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}" \
               ENV_EXECUTION_MODE="PAPER" \
               GUMBEL_MODE="half" \
               TRADE_CYCLE_INTERVAL_SECS="300" \
