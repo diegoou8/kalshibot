@@ -51,19 +51,24 @@ jobs:
           # Strip accidental newlines/CR from multi-line secrets before passing to az CLI
           CLEAN_CONN_STR=$(printf '%s' "$CONN_STR" | tr -d '\n\r')
           CLEAN_KEY=$(printf '%s' "$PRIVATE_KEY" | tr -d '\r')
+          SETTINGS=(
+            "AZURE_SQL_CONN_STR=$CLEAN_CONN_STR"
+            "KALSHI_DEMO_KEY_ID=${{ secrets.KALSHI_DEMO_KEY_ID }}"
+            "ENV_EXECUTION_MODE=PAPER"
+            "GUMBEL_MODE=half"
+            "TRADE_CYCLE_INTERVAL_SECS=300"
+            "MONITOR_INTERVAL_SECS=120"
+            "TZ=America/Chicago"
+            "WEBSITES_PORT=8000"
+          )
+          # Only push the private key if the secret is actually set
+          if [ -n "$CLEAN_KEY" ]; then
+            SETTINGS+=("KALSHI_DEMO_PRIVATE_KEY=$CLEAN_KEY")
+          fi
           az webapp config appsettings set \
             --name KBot \
             --resource-group bot \
-            --settings \
-              "AZURE_SQL_CONN_STR=$CLEAN_CONN_STR" \
-              KALSHI_DEMO_KEY_ID="${{ secrets.KALSHI_DEMO_KEY_ID }}" \
-              "KALSHI_DEMO_PRIVATE_KEY=$CLEAN_KEY" \
-              ENV_EXECUTION_MODE="PAPER" \
-              GUMBEL_MODE="half" \
-              TRADE_CYCLE_INTERVAL_SECS="300" \
-              MONITOR_INTERVAL_SECS="120" \
-              TZ="America/Chicago" \
-              WEBSITES_PORT="8000"
+            --settings "${SETTINGS[@]}"
 
       # ── 4. Update container image (triggers restart with env vars already set)
       - name: Update container image and registry credentials
