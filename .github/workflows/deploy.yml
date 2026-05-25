@@ -44,14 +44,20 @@ jobs:
 
       # ── 3. Set env vars FIRST so they exist when the container starts ───────
       - name: Sync environment variables to Web App
+        env:
+          CONN_STR: ${{ secrets.AZURE_SQL_CONN_STR }}
+          PRIVATE_KEY: ${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}
         run: |
+          # Strip accidental newlines/CR from multi-line secrets before passing to az CLI
+          CLEAN_CONN_STR=$(printf '%s' "$CONN_STR" | tr -d '\n\r')
+          CLEAN_KEY=$(printf '%s' "$PRIVATE_KEY" | tr -d '\r')
           az webapp config appsettings set \
             --name KBot \
             --resource-group bot \
             --settings \
-              AZURE_SQL_CONN_STR="${{ secrets.AZURE_SQL_CONN_STR }}" \
+              "AZURE_SQL_CONN_STR=$CLEAN_CONN_STR" \
               KALSHI_DEMO_KEY_ID="${{ secrets.KALSHI_DEMO_KEY_ID }}" \
-              KALSHI_DEMO_PRIVATE_KEY="${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}" \
+              "KALSHI_DEMO_PRIVATE_KEY=$CLEAN_KEY" \
               ENV_EXECUTION_MODE="PAPER" \
               GUMBEL_MODE="half" \
               TRADE_CYCLE_INTERVAL_SECS="300" \
