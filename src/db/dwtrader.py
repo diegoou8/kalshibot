@@ -452,9 +452,10 @@ class DWTraderDB:
                 self._add_column_if_not_exists(c, "executions", "lvr_cents", "FLOAT")
 
                 # 16. BOT CONFIG — runtime key/value overrides (e.g. GUMBEL_MODE)
+                # Note: 'key' is reserved in SQL Server — column is named config_key.
                 self._create_table_if_not_exists(c, "bot_config", """
                     CREATE TABLE bot_config (
-                        key        NVARCHAR(100) PRIMARY KEY,
+                        config_key NVARCHAR(100) PRIMARY KEY,
                         value      NVARCHAR(MAX) NOT NULL,
                         updated_at DATETIME2     NOT NULL
                     )
@@ -1472,7 +1473,7 @@ class DWTraderDB:
         try:
             with self.get_connection() as conn:
                 c = conn.cursor()
-                c.execute("SELECT value FROM bot_config WHERE key = ?", (key,))
+                c.execute("SELECT value FROM bot_config WHERE config_key = ?", (key,))
                 row = c.fetchone()
                 return row[0] if row else default
         except Exception as e:
@@ -1487,12 +1488,13 @@ class DWTraderDB:
                 c.execute(
                     """
                     MERGE bot_config AS tgt
-                    USING (SELECT ? AS key, ? AS value, ? AS updated_at) AS src
-                    ON tgt.key = src.key
+                    USING (SELECT ? AS config_key, ? AS value, ? AS updated_at) AS src
+                    ON tgt.config_key = src.config_key
                     WHEN MATCHED THEN
                         UPDATE SET value = src.value, updated_at = src.updated_at
                     WHEN NOT MATCHED THEN
-                        INSERT (key, value, updated_at) VALUES (src.key, src.value, src.updated_at);
+                        INSERT (config_key, value, updated_at)
+                        VALUES (src.config_key, src.value, src.updated_at);
                     """,
                     (key, value, now),
                 )

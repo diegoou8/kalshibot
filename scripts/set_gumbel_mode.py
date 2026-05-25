@@ -42,7 +42,7 @@ def _connect():
 
 def _get_current(conn) -> str:
     c = conn.cursor()
-    c.execute("SELECT value FROM bot_config WHERE key = 'GUMBEL_MODE'")
+    c.execute("SELECT value FROM bot_config WHERE config_key = 'GUMBEL_MODE'")
     row = c.fetchone()
     return row[0] if row else os.getenv("GUMBEL_MODE", "half") + " (env fallback)"
 
@@ -53,12 +53,13 @@ def _set(conn, mode: str) -> None:
     c.execute(
         """
         MERGE bot_config AS tgt
-        USING (SELECT ? AS key, ? AS value, ? AS updated_at) AS src
-        ON tgt.key = src.key
+        USING (SELECT ? AS config_key, ? AS value, ? AS updated_at) AS src
+        ON tgt.config_key = src.config_key
         WHEN MATCHED THEN
             UPDATE SET value = src.value, updated_at = src.updated_at
         WHEN NOT MATCHED THEN
-            INSERT (key, value, updated_at) VALUES (src.key, src.value, src.updated_at);
+            INSERT (config_key, value, updated_at)
+            VALUES (src.config_key, src.value, src.updated_at);
         """,
         ("GUMBEL_MODE", mode, now),
     )
