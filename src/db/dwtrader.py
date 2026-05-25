@@ -451,6 +451,15 @@ class DWTraderDB:
                 # Migration: lvr_cents on executions
                 self._add_column_if_not_exists(c, "executions", "lvr_cents", "FLOAT")
 
+                # 16. BOT CONFIG — runtime key/value overrides (e.g. GUMBEL_MODE)
+                self._create_table_if_not_exists(c, "bot_config", """
+                    CREATE TABLE bot_config (
+                        key        NVARCHAR(100) PRIMARY KEY,
+                        value      NVARCHAR(MAX) NOT NULL,
+                        updated_at DATETIME2     NOT NULL
+                    )
+                """)
+
                 conn.commit()
                 logger.info("Azure SQL schema initialised / migrations applied.")
         except Exception as e:
@@ -1454,3 +1463,40 @@ class DWTraderDB:
         except Exception as e:
             logger.error(f"Error upserting experiment run for {run_date}/{gumbel_mode}: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # BOT CONFIG — runtime key/value store (hot-swap without restart)
+    # ------------------------------------------------------------------
+
+    def get_config(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT value FROM bot_config WHERE key = ?", (key,))
+                row = c.fetchone()
+                return row[0] if row else default
+        except Exception as e:
+            logger.error("get_config(%s) failed: %s", key, e)
+            return default
+
+    def set_config(self, key: str, value: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                c.execute(
+                    """
+                    MERGE bot_config AS tgt
+                    USING (SELECT ? AS key, ? AS value, ? AS updated_at) AS src
+                    ON tgt.key = src.key
+                    WHEN MATCHED THEN
+                        UPDATE SET value = src.value, updated_at = src.updated_at
+                    WHEN NOT MATCHED THEN
+                        INSERT (key, value, updated_at) VALUES (src.key, src.value, src.updated_at);
+                    """,
+                    (key, value, now),
+                )
+                conn.commit()
+                logger.info("bot_config: %s = %s", key, value)
+        except Exception as e:
+            logger.error("set_config(%s, %s) failed: %s", key, value, e)

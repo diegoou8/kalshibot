@@ -170,6 +170,17 @@ async def run() -> None:
 
         # ── Trade cycle (every 5 min) ─────────────────────────────────────────
         if now - last_trade >= TRADE_CYCLE_INTERVAL:
+            # Hot-swap GUMBEL_MODE from DB (no restart needed)
+            try:
+                db_mode = _db.get_config("GUMBEL_MODE")
+                if db_mode and db_mode != Config.GUMBEL_MODE:
+                    logger.info(
+                        "GUMBEL_MODE hot-swap: %s -> %s (from bot_config)",
+                        Config.GUMBEL_MODE, db_mode,
+                    )
+                    Config.GUMBEL_MODE = db_mode
+            except Exception as exc:
+                logger.warning("GUMBEL_MODE hot-swap check failed: %s", exc)
             try:
                 await trade_cycle(env_mode)
             except Exception as exc:

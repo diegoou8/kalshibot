@@ -1,10 +1,14 @@
 """
-Set GUMBEL_MODE in .env for the A/B/C experiment.
+Set GUMBEL_MODE for the A/B/C experiment by writing to the bot_config DB table.
+
+Works both locally and inside the Azure container (via SSH or az webapp exec).
+The running bot reads the new value on the next trade cycle — no restart needed.
 
 Usage:
     python scripts/set_gumbel_mode.py none
     python scripts/set_gumbel_mode.py half
     python scripts/set_gumbel_mode.py full
+    python scripts/set_gumbel_mode.py        # show current value + schedule
 
 A/B/C schedule:
     Apr 28: half   (baseline)
@@ -14,8 +18,16 @@ A/B/C schedule:
     May 05: none   (extended none sample)
 """
 import sys
-import re
+import os
+from datetime import datetime, timezone
 from pathlib import Path
+
+# Load .env locally (no-op if env var already set in container)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except ImportError:
+    pass
 
 _VALID_MODES = ("none", "half", "full")
 _SCHEDULE = {
@@ -25,15 +37,39 @@ _SCHEDULE = {
     "2026-05-04": "none",
     "2026-05-05": "none",
 }
-_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 
-def _next_day(today: str) -> str:
-    dates = sorted(_SCHEDULE)
-    for i, d in enumerate(dates):
-        if d == today and i + 1 < len(dates):
-            return dates[i + 1]
-    return "n/a"
+def _next_scheduled(today: str):
+    dates = sorted(d for d in _SCHEDULE if d > today)
+    if dates:
+        return dates[0], _SCHEDULE[dates[0]]
+    return None, None
+
+
+def _get_db():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.db.dwtrader import DWTraderDB
+    return DWTraderDB()
+
+
+def show_status(db) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current = db.get_config("GUMBEL_MODE") or os.getenv("GUMBEL_MODE", "half")
+    scheduled_today = _SCHEDULE.get(today, "not scheduled")
+    next_date, next_mode = _next_scheduled(today)
+
+    print(f"Current GUMBEL_MODE (bot_config): {current}")
+    print(f"Today ({today}) schedule:          {scheduled_today}")
+    if next_date:
+        print(f"Next scheduled change ({next_date}): {next_mode}")
+    print()
+    print("Full A/B/C schedule:")
+    for d, m in sorted(_SCHEDULE.items()):
+        marker = " <-- today" if d == today else ""
+        print(f"  {d}: {m}{marker}")
+    print()
+    print("After each day's trading, run:")
+    print("  python analytics/calibration_report.py --days 3")
 
 
 def set_mode(mode: str) -> None:
@@ -41,43 +77,31 @@ def set_mode(mode: str) -> None:
         print(f"[error] Invalid mode '{mode}'. Choose from: {', '.join(_VALID_MODES)}")
         sys.exit(1)
 
-    # Read existing .env (create if missing)
-    if _ENV_PATH.exists():
-        content = _ENV_PATH.read_text(encoding="utf-8")
-    else:
-        content = ""
+    db = _get_db()
+    db.set_config("GUMBEL_MODE", mode)
 
-    # Replace or append GUMBEL_MODE line
-    pattern = re.compile(r"^GUMBEL_MODE\s*=.*$", re.MULTILINE)
-    new_line = f"GUMBEL_MODE={mode}"
-    if pattern.search(content):
-        content = pattern.sub(new_line, content)
-    else:
-        content = content.rstrip("\n") + f"\n{new_line}\n"
-
-    _ENV_PATH.write_text(content, encoding="utf-8")
-
-    from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    expected = _SCHEDULE.get(today, "not scheduled")
-    next_d   = _next_day(today)
-    next_m   = _SCHEDULE.get(next_d, "n/a")
+    scheduled_today = _SCHEDULE.get(today, "not scheduled")
+    next_date, next_mode = _next_scheduled(today)
 
-    print(f"[ok] GUMBEL_MODE={mode} written to {_ENV_PATH}")
-    if expected != mode:
-        print(f"[!]  Today ({today}) schedule expects '{expected}' but you set '{mode}'.")
-    else:
+    print(f"[ok] GUMBEL_MODE={mode} written to bot_config (takes effect next trade cycle)")
+    if scheduled_today != "not scheduled" and scheduled_today != mode:
+        print(f"[!]  Today ({today}) schedule expects '{scheduled_today}' but you set '{mode}'.")
+    elif scheduled_today == mode:
         print(f"     Today ({today}) schedule: {mode}  [on schedule]")
-    if next_d != "n/a":
-        print(f"     Tomorrow ({next_d}): run  python scripts/set_gumbel_mode.py {next_m}")
+    if next_date:
+        print(f"     Next change ({next_date}): python scripts/set_gumbel_mode.py {next_mode}")
     print(f"     After trading: python analytics/calibration_report.py --days 3")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        db = _get_db()
+        show_status(db)
+        sys.exit(0)
+
     if len(sys.argv) != 2:
         print(__doc__)
-        print(f"\nA/B/C schedule:")
-        for d, m in sorted(_SCHEDULE.items()):
-            print(f"  {d}: {m}")
         sys.exit(1)
+
     set_mode(sys.argv[1].strip().lower())
