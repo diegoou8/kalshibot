@@ -48,8 +48,11 @@ jobs:
           CONN_STR: ${{ secrets.AZURE_SQL_CONN_STR }}
           PRIVATE_KEY: ${{ secrets.KALSHI_DEMO_PRIVATE_KEY }}
         run: |
-          # Strip accidental newlines/CR from multi-line secrets before passing to az CLI
-          CLEAN_CONN_STR=$(printf '%s' "$CONN_STR" | tr -d '\n\r')
+          # Strip newlines/CR, then remove any 2+ space run left behind by indented
+          # line-break pasting in the GitHub Secrets UI.
+          # ODBC connection strings only use single spaces (inside driver name braces);
+          # any double-space is always line-break artifact and safe to remove entirely.
+          CLEAN_CONN_STR=$(printf '%s' "$CONN_STR" | tr -d '\n\r' | sed 's/  \+//g')
           CLEAN_KEY=$(printf '%s' "$PRIVATE_KEY" | tr -d '\r')
           SETTINGS=(
             "AZURE_SQL_CONN_STR=$CLEAN_CONN_STR"
