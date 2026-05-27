@@ -14,7 +14,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timezone, date as _date
+from datetime import datetime, timezone, date as _date, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,6 +26,11 @@ from src.db.dwtrader import DWTraderDB
 from src.db.maintenance import prune as _db_prune
 from src.services.kalshi_client import client
 from src.config.experiment import GUMBEL_SCHEDULE
+
+# check_outcomes lives in scripts/ — add it to path so bot_runner can call run_check directly.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+from check_outcomes import run_check as _run_outcome_check
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,10 +142,11 @@ async def run() -> None:
     # Launch weather polling as a fire-and-forget background task.
     asyncio.create_task(_run_weather_loop(_db), name="weather-ingest")
 
-    last_trade   = 0.0
-    last_monitor = 0.0
-    last_prune_date: Optional[_date] = None
-    last_gumbel_date: Optional[str] = None
+    last_trade        = 0.0
+    last_monitor      = 0.0
+    last_prune_date:   Optional[_date] = None
+    last_outcome_date: Optional[_date] = None
+    last_gumbel_date:  Optional[str]   = None
 
     while True:
         # ── Halt check ────────────────────────────────────────────────────────
@@ -197,6 +203,27 @@ async def run() -> None:
             except Exception as exc:
                 logger.error("trade_cycle crashed: %s", exc, exc_info=True)
             last_trade = time.monotonic()
+
+        # ── Nightly outcome check (once per day at PRUNE_HOUR_UTC) ──────────────
+        # Fires after Kalshi settles all daily temp markets (~midnight US Eastern).
+        # Checks yesterday's fills, writes realized PnL + Brier scores to DB.
+        if now_utc.hour == PRUNE_HOUR_UTC and now_utc.date() != last_outcome_date:
+            yesterday = (now_utc.date() - timedelta(days=1)).isoformat()
+            logger.info("Running nightly outcome check for %s ...", yesterday)
+            try:
+                summary = await _run_outcome_check(_db, yesterday, writeback=True)
+                last_outcome_date = now_utc.date()
+                logger.info(
+                    "Outcome check complete | date=%s | settled=%d | pending=%d"
+                    " | pnl=$%.2f | brier_updates=%d",
+                    yesterday,
+                    summary["settled"],
+                    summary["pending"],
+                    summary["total_pnl_cents"] / 100,
+                    summary["written_back"],
+                )
+            except Exception as exc:
+                logger.error("Outcome check failed: %s", exc, exc_info=True)
 
         # ── Nightly DB prune (once per day at PRUNE_HOUR_UTC) ─────────────────
         if now_utc.hour == PRUNE_HOUR_UTC and now_utc.date() != last_prune_date:

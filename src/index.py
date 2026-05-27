@@ -766,6 +766,36 @@ async def trade_cycle(env_mode: str):
     except Exception as _e:
         logger.error("EXPERIMENT_RUN_LOG_FAILED: %s", _e)
 
+    # Portfolio reconcile: pull recent fills from Kalshi and write any that
+    # weren't captured in real-time (IOC orders that filled before our poll).
+    try:
+        fills = await client.get_portfolio_fills(limit=100)
+        with db.get_connection() as _conn:
+            _c = _conn.cursor()
+            _c.execute("SELECT order_id, exchange_order_id, ticker, side, environment FROM orders WHERE exchange_order_id IS NOT NULL")
+            _order_map = {r[1]: (r[0], r[2], r[3], r[4]) for r in _c.fetchall()}
+            _c.execute("SELECT exchange_trade_id FROM executions")
+            _seen = {r[0] for r in _c.fetchall()}
+        _reconciled = 0
+        for _f in fills:
+            _fid = _f["fill_id"]
+            if _fid in _seen or _f["order_id"] not in _order_map:
+                continue
+            _oid, _ticker, _side, _env = _order_map[_f["order_id"]]
+            _qty   = int(float(_f["count_fp"]))
+            _price = int(round(float(_f["yes_price_dollars"]) * 100)) if _side == "yes" else int(round(float(_f["no_price_dollars"]) * 100))
+            _ts    = _f["created_time"].replace("Z", "")
+            if db.log_execution(order_id=_oid, exchange_trade_id=_fid, ticker=_ticker, side=_side, price=_price, qty=_qty, environment=_env, timestamp=_ts):
+                with db.get_connection() as _conn:
+                    _c = _conn.cursor()
+                    _c.execute("UPDATE orders SET status='executed', updated_at=GETDATE() WHERE order_id=?", (_oid,))
+                    _conn.commit()
+                _reconciled += 1
+        if _reconciled:
+            logger.info("FILL_RECONCILE: captured %d missed fill(s) from Kalshi portfolio", _reconciled)
+    except Exception as _e:
+        logger.error("FILL_RECONCILE failed: %s", _e)
+
 
 async def monitor_positions(env_mode: str) -> int:
     """

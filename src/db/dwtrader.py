@@ -617,11 +617,12 @@ class DWTraderDB:
         environment: str,
         lvr_cents: Optional[float] = None,
         gumbel_mode: Optional[str] = None,
+        timestamp: Optional[str] = None,
     ) -> Optional[int]:
         try:
             with self.get_connection() as conn:
                 c = conn.cursor()
-                now = datetime.now().isoformat()
+                now = timestamp if timestamp else datetime.now().isoformat()
 
                 # 1. Log Execution
                 c.execute(
