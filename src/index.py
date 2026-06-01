@@ -22,7 +22,7 @@ from src.layer2.particle_filter import TemperatureParticleFilter
 from src.layer2.gating_logic import TradeGating
 from src.brain.weather_estimator import (
     estimate_p_yes, get_ar1_metadata, get_forecast_temp_for_ticker,
-    load_city_params, _CITY_MAP, _FORECAST_SIGMA_F, _AR1_PHI
+    load_city_params, _CITY_MAP, _FORECAST_SIGMA_F, _AR1_PHI, _parse_ticker
 )
 from analytics.cycle_diagnostics import CycleDiagnostics, compute_strike_z
 
@@ -323,6 +323,8 @@ async def trade_cycle(env_mode: str):
         if (yes_ask + no_ask - 100) > Config.MAX_SPREAD_CENTS:
             continue
         valid_markets.append(market)
+        if ticker and ticker.upper().startswith("KXTEMP"):
+            diag.n_kxtemp_scanned += 1
     diag.n_spread_ok = len(valid_markets)
 
     # ── Phase 1b: Build posteriors in parallel ────────────────────────────────
@@ -380,7 +382,16 @@ async def trade_cycle(env_mode: str):
         p_yes = posterior.get("P_adj_YES")
         if p_yes is None:
             diag.n_no_p_yes += 1
+            if ticker.upper().startswith("KXTEMP"):
+                _pt = _parse_ticker(ticker)
+                if _pt is None or _pt.get("city") not in _CITY_MAP:
+                    diag.n_kxtemp_unknown_city += 1
+                else:
+                    diag.n_kxtemp_no_estimate += 1
             continue
+
+        if ticker.upper().startswith("KXTEMP"):
+            diag.n_kxtemp_p_yes += 1
 
         # ── Avellaneda-Stoikov inventory-aware edge threshold ──────────────────
         # Base threshold (15c) is bumped upward when we already hold exposure in

@@ -44,6 +44,9 @@ _CITY_MAP: Dict[str, Tuple[float, float, str]] = {
     "SAT":  (29.4241, -98.4936,  "America/Chicago"),
     "MIN":  (44.9778, -93.2650,  "America/Chicago"),
     "OKC":  (35.4676, -97.5164,  "America/Chicago"),
+    "NOLA": (29.9511, -90.0715,  "America/Chicago"),    # New Orleans, LA
+    "AUS":  (30.2672, -97.7431,  "America/Chicago"),    # Austin, TX
+    "LV":   (36.1699, -115.1398, "America/Los_Angeles"), # Las Vegas, NV
 }
 
 # Forecast uncertainty σ (°F) — reflects ensemble spread + model error.
@@ -77,6 +80,42 @@ _LAT_LON_TO_CITY: Dict[str, str] = {
     f"{lat:.3f},{lon:.3f}": city
     for city, (lat, lon, _tz) in _CITY_MAP.items()
 }
+
+# ── City-code alias maps ──────────────────────────────────────────────────────
+# Kalshi uses different city suffixes across market types (KXTEMP vs KXHIGH) and
+# has introduced T-prefixed variants and new cities over time.  Any suffix not
+# found in _CITY_MAP is looked up here before estimate_p_yes is attempted.
+# If still not found, estimate_p_yes returns None and a warning is logged once
+# per process lifetime (via _unknown_city_logged) to avoid per-market spam.
+
+# KXTEMP hourly-temp markets use a different city code than KXHIGH daily-high markets.
+_KXTEMP_CITY_ALIAS: Dict[str, str] = {
+    "NYCH": "NYC",   # KXTEMPNYCH-... (48 markets observed 2026-06-01)
+}
+
+# KXHIGH daily-high markets have accumulated T-prefixed variants and new cities
+# that are not yet in _CITY_MAP.  Alias maps to existing _CITY_MAP entry.
+_KXHIGH_CITY_ALIAS: Dict[str, str] = {
+    # T-prefix variants — same city, different Kalshi abbreviation
+    "NY":    "NYC",   # KXHIGHNY-... (NY used instead of NYC)
+    "TSFO":  "SFO",
+    "TPHX":  "PHX",
+    "TMIN":  "MIN",
+    "TATL":  "ATL",
+    "TOKC":  "OKC",
+    "TBOS":  "BOS",
+    "TSATX": "SAT",
+    "TSEA":  "SEA",
+    "TDAL":  "DAL",
+    # New cities added to Kalshi after initial _CITY_MAP was written.
+    # Coordinates are best-available city-centre approximations.
+    "TNOLA": "NOLA",  # New Orleans, LA  — see _CITY_MAP entry above
+    "AUS":   "AUS",   # Austin, TX       — see _CITY_MAP entry above
+    "TLV":   "LV",    # Las Vegas, NV    — see _CITY_MAP entry above
+}
+
+# City codes already emitted as unknown warnings (once per process lifetime).
+_unknown_city_logged: set = set()
 
 
 def _tau_to_bin(tau_hrs: float) -> str:
@@ -124,7 +163,16 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        city, date_str, lower = m.group(1).upper(), m.group(2).upper(), float(m.group(3))
+        raw_city = m.group(1).upper()
+        _norm = _KXHIGH_CITY_ALIAS.get(raw_city, raw_city)
+        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
+            logger.warning(
+                "UNKNOWN_KXHIGH_CITY_CODE: ticker=%s suffix=%s — add to _KXHIGH_CITY_ALIAS",
+                ticker, raw_city,
+            )
+            _unknown_city_logged.add(_norm)
+        city = _norm
+        date_str, lower = m.group(2).upper(), float(m.group(3))
         return {"type": "HIGH_BAND", "city": city, "date_str": date_str,
                 "lower": lower, "upper": lower + 1.0, "hour": None}
 
@@ -134,7 +182,16 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        city, date_str, thresh = m.group(1).upper(), m.group(2).upper(), float(m.group(3))
+        raw_city = m.group(1).upper()
+        _norm = _KXHIGH_CITY_ALIAS.get(raw_city, raw_city)
+        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
+            logger.warning(
+                "UNKNOWN_KXHIGH_CITY_CODE: ticker=%s suffix=%s — add to _KXHIGH_CITY_ALIAS",
+                ticker, raw_city,
+            )
+            _unknown_city_logged.add(_norm)
+        city = _norm
+        date_str, thresh = m.group(2).upper(), float(m.group(3))
         return {"type": "HIGH_ABOVE", "city": city, "date_str": date_str,
                 "threshold": thresh, "hour": None}
 
@@ -144,8 +201,17 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        city, date_str, hour, thresh = (
-            m.group(1).upper(), m.group(2).upper(), int(m.group(3)), float(m.group(4))
+        raw_city = m.group(1).upper()
+        _norm = _KXTEMP_CITY_ALIAS.get(raw_city, raw_city)
+        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
+            logger.warning(
+                "UNKNOWN_KXTEMP_CITY_CODE: ticker=%s suffix=%s — add to _KXTEMP_CITY_ALIAS",
+                ticker, raw_city,
+            )
+            _unknown_city_logged.add(_norm)
+        city = _norm
+        date_str, hour, thresh = (
+            m.group(2).upper(), int(m.group(3)), float(m.group(4))
         )
         return {"type": "HOURLY_ABOVE", "city": city, "date_str": date_str,
                 "threshold": thresh, "hour": hour}

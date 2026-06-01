@@ -57,6 +57,12 @@ class CycleDiagnostics:
     n_blocked_contract_cap: int = 0       # dedup: would exceed 4 contracts in slot
     n_fills: int = 0                # orders that actually filled
 
+    # KXTEMP hourly-temp market sub-funnel
+    n_kxtemp_scanned:       int = 0   # KXTEMP markets after spread filter
+    n_kxtemp_unknown_city:  int = 0   # failed: suffix not in alias map
+    n_kxtemp_no_estimate:   int = 0   # parsed OK but estimate_p_yes returned None
+    n_kxtemp_p_yes:         int = 0   # produced a valid P(YES)
+
     # Gate breakdown (key = "EV" | "STALE" | "SPREAD" | "FRAGILITY" |
     #                       "ESS" | "DEPTH" | "SETTLEMENT" | "VARIANCE")
     gate_counts: Counter = field(default_factory=Counter)
@@ -131,6 +137,15 @@ class CycleDiagnostics:
         lines.append(f"  Contract cap blocked  : {self.n_blocked_contract_cap:>5}")
         lines.append(f"  Dedup removed         : {self.n_dedup_removed:>5}")
         lines.append(f"  Final fills           : {self.n_fills:>5}")
+
+        # ── 1b. KXTEMP coverage sub-funnel ────────────────────────────────────
+        if self.n_kxtemp_scanned > 0:
+            h("KXTEMP COVERAGE (hourly temp markets)")
+            _pct_pyp = pct(self.n_kxtemp_p_yes, self.n_kxtemp_scanned)
+            lines.append(f"  Scanned           : {self.n_kxtemp_scanned:>5}")
+            lines.append(f"  Produced P(YES)   : {self.n_kxtemp_p_yes:>5}  ({_pct_pyp})")
+            lines.append(f"  Unknown city code : {self.n_kxtemp_unknown_city:>5}")
+            lines.append(f"  No estimate       : {self.n_kxtemp_no_estimate:>5}")
 
         # ── 2. Gate breakdown ─────────────────────────────────────────────────
         if self.gate_counts:

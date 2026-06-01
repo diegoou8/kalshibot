@@ -10,7 +10,7 @@ Traces each city in _CITY_MAP through every step of the probability pipeline:
 
 Also audits per-city DB state:
   - sigma_days : rows in ar1_residuals for this city
-  - sigma_val  : MLE σ (None = fewer than 14 days, uses 4.0° default)
+  - sigma_val  : MLE sigma (None = fewer than 14 days, uses 4.0deg default)
   - brier      : rolling 30-trade Brier score (None = fewer than 10 trades)
 
 And documents market-type gaps (KXTEMP / KXRAIN).
@@ -137,7 +137,7 @@ async def _probe_city(
     elif not date_ok:
         reason = "DATE_PARSE_FAIL"
     elif not weather_ok:
-        reason = "FORECAST_FETCH_FAIL  ← Open-Meteo returned None"
+        reason = "FORECAST_FETCH_FAIL  <- Open-Meteo returned None"
     elif not estimate_ok:
         reason = "UNKNOWN (all inputs OK but estimate_p_yes still None)"
     else:
@@ -189,7 +189,7 @@ async def main() -> None:
     print("\n[1] KXHIGH market trace — one sample ticker per _CITY_MAP entry\n")
     hdr = (
         f"{'CITY':<6} {'WX':>3} {'SIGMA_D':>8} {'SIGMA_F':>8} "
-        f"{'BRIER':>7} {'N_B':>4} {'FCAST_°F':>9} {'P_YES':>7}   REASON"
+        f"{'BRIER':>7} {'N_B':>4} {'FCAST_F':>9} {'P_YES':>7}   REASON"
     )
     print(hdr)
     print("-" * W)
@@ -206,7 +206,7 @@ async def main() -> None:
         brier   = f"{r['brier_val']:.3f}" if r["brier_val"] is not None else "—"
         fcast   = f"{r['forecast_f']:.1f}" if r["forecast_f"] is not None else "None"
         pyes    = f"{r['p_yes']:.3f}" if r["p_yes"] is not None else "None"
-        mark    = "✓" if r["reason"] == "OK" else "✗"
+        mark    = "OK" if r["reason"] == "OK" else "!!"
         print(
             f"{r['city']:<6} {'Y' if r['weather_ok'] else 'N':>3} "
             f"{sigma_d:>8} {sigma_f:>8} {brier:>7} {r['n_brier']:>4} "
@@ -236,7 +236,7 @@ async def main() -> None:
     print(f"  {'TICKER EXAMPLE':<36} {'PARSED AS':<12} {'IN MAP?':<10} {'P_YES'}")
     print(f"  {'-'*36:<36} {'-'*12:<12} {'-'*10:<10} {'-'*6}")
 
-    # Aliases seen in live logs (city code Kalshi uses → _CITY_MAP key that should match)
+    # Aliases seen in live logs (city code Kalshi uses -> _CITY_MAP key that should match)
     for alias, correct_key in _KXTEMP_ALIASES_SEEN.items():
         ticker  = _kxtemp_ticker(alias, target_date)
         parsed  = _parse_ticker(ticker)
@@ -244,7 +244,7 @@ async def main() -> None:
         in_map  = p_city in _CITY_MAP
         pyes    = await estimate_p_yes(ticker, tau_hrs=24.0) if parsed else None
         verdict = "MISMATCH — should be " + correct_key
-        print(f"  {ticker:<36} {p_city:<12} {'YES' if in_map else 'NO':<10} {pyes!r:<8}  ← {verdict}")
+        print(f"  {ticker:<36} {p_city:<12} {'YES' if in_map else 'NO':<10} {pyes!r:<8}  <- {verdict}")
 
     # Spot-check: does the correct city code work?
     print()
@@ -254,7 +254,7 @@ async def main() -> None:
         parsed = _parse_ticker(ticker)
         in_map = parsed is not None and parsed.get("city") in _CITY_MAP
         pyes   = await estimate_p_yes(ticker, tau_hrs=24.0) if parsed else None
-        mark   = "✓" if pyes is not None else "✗ None"
+        mark   = "OK" if pyes is not None else "!! None"
         print(f"  KXTEMP{test_code:<10}  in_map={str(in_map):<5}  p_yes={pyes!r}  {mark}")
 
     # ── Section 3: KXRAIN ─────────────────────────────────────────────────────
@@ -266,7 +266,7 @@ async def main() -> None:
         print(f"  {ticker}")
         print(f"    _parse_ticker returned: {parsed!r}")
         print(f"    Reason : _parse_ticker has no regex for {prefix!r}")
-        print(f"    Effect : ALL {prefix}* markets → P(YES) = None, every cycle\n")
+        print(f"    Effect : ALL {prefix}* markets -> P(YES) = None, every cycle\n")
 
     # ── Section 4: DB calibration health ────────────────────────────────────
     if db is not None:
@@ -328,8 +328,8 @@ async def main() -> None:
 
     cause_lines.append(
         "  [E]   MARKET TYPE GAPS — bulk of the 663 'No P(YES)' in the trade funnel:\n"
-        "          KXRAIN*   → _parse_ticker has no KXRAIN regex → always None\n"
-        "          KXTEMPNYCH → city='NYCH' not in _CITY_MAP (should map to NYC coords)\n"
+        "          KXRAIN*   -> _parse_ticker has no KXRAIN regex -> always None\n"
+        "          KXTEMPNYCH -> city='NYCH' not in _CITY_MAP (should map to NYC coords)\n"
         "          Other KXTEMP* codes may have the same mismatch.\n"
         "          These two gap types likely account for 500-600 of the 945 markets\n"
         "          scanned each cycle that never produce an estimate."

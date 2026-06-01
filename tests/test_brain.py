@@ -195,5 +195,55 @@ class TestDecisionEngineWithBrain(unittest.TestCase):
         self.assertEqual(intent.side, "no")
 
 
+class TestKxtempCityAlias(unittest.TestCase):
+    """_parse_ticker alias normalization — pure logic, no I/O."""
+
+    def test_nych_maps_to_nyc(self):
+        """KXTEMPNYCH suffix NYCH resolves to NYC via _KXTEMP_CITY_ALIAS."""
+        from src.brain.weather_estimator import _parse_ticker, _CITY_MAP
+        result = _parse_ticker("KXTEMPNYCH-26JUN0211-T65.99")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["city"], "NYC")
+        self.assertIn(result["city"], _CITY_MAP)
+
+    def test_unknown_kxtemp_suffix_returns_result_with_unmapped_city(self):
+        """Suffix with no alias entry still returns a parse result (city not in map)."""
+        from src.brain.weather_estimator import _parse_ticker, _CITY_MAP
+        result = _parse_ticker("KXTEMPXXXX-26JUN0211-T65.99")
+        self.assertIsNotNone(result)
+        self.assertNotIn(result["city"], _CITY_MAP)
+
+    def test_kxhigh_parsing_unchanged_for_existing_cities(self):
+        """KXHIGH tickers for cities already in _CITY_MAP parse correctly."""
+        from src.brain.weather_estimator import _parse_ticker, _CITY_MAP
+        for ticker, expected_city in [
+            ("KXHIGHLAX-26JUN01-B74.5", "LAX"),
+            ("KXHIGHTDC-26JUN02-T79",   "TDC"),
+            ("KXHIGHCHI-26JUN01-B82.5", "CHI"),
+        ]:
+            with self.subTest(ticker=ticker):
+                result = _parse_ticker(ticker)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["city"], expected_city)
+                self.assertIn(result["city"], _CITY_MAP)
+
+    def test_kxhigh_tprefix_alias_resolves(self):
+        """KXHIGH T-prefix codes like TSFO resolve to SFO via _KXHIGH_CITY_ALIAS."""
+        from src.brain.weather_estimator import _parse_ticker, _CITY_MAP
+        cases = [
+            ("KXHIGHTSFO-26JUN01-B65.5",  "SFO"),
+            ("KXHIGHTDAL-26JUN01-B95.5",  "DAL"),
+            ("KXHIGHNY-26JUN01-T75",       "NYC"),
+            ("KXHIGHTNOLA-26JUN01-T90",   "NOLA"),
+            ("KXHIGHAUS-26JUN01-T95",      "AUS"),
+        ]
+        for ticker, expected_city in cases:
+            with self.subTest(ticker=ticker):
+                result = _parse_ticker(ticker)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["city"], expected_city)
+                self.assertIn(result["city"], _CITY_MAP)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
