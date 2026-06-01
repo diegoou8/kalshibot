@@ -118,6 +118,59 @@ _KXHIGH_CITY_ALIAS: Dict[str, str] = {
 _unknown_city_logged: set = set()
 
 
+def normalize_city_code(raw_code: str, market_prefix: Optional[str] = None) -> str:
+    """
+    Resolve a Kalshi city suffix to its canonical _CITY_MAP key.
+
+    raw_code:      city code as extracted from a ticker (e.g. 'TSFO', 'NYCH', 'LAX').
+    market_prefix: optional hint — 'KXHIGH' or 'KXTEMP' — selects the right alias
+                   map when the same raw code could theoretically appear in both types.
+                   When None, KXHIGH is tried first, then KXTEMP (disjoint today).
+
+    Returns the canonical key (e.g. 'SFO', 'NYC', 'LAX'). If no alias resolves the
+    code it is returned unchanged (uppercased) and a one-time WARNING is emitted with
+    the appropriate UNKNOWN_*_CITY_CODE tag to prevent per-market log spam.
+
+    This is the single authoritative normalization point.  _parse_ticker() and
+    _ticker_city() both delegate to this function; add new aliases only here.
+    """
+    code = raw_code.upper()
+    if code in _CITY_MAP:
+        return code
+
+    prefix_up = (market_prefix or "").upper()
+    if "TEMP" in prefix_up:
+        normed = _KXTEMP_CITY_ALIAS.get(code, code)
+    elif "HIGH" in prefix_up:
+        normed = _KXHIGH_CITY_ALIAS.get(code, code)
+    else:
+        normed = _KXHIGH_CITY_ALIAS.get(code) or _KXTEMP_CITY_ALIAS.get(code) or code
+
+    if normed not in _CITY_MAP and normed not in _unknown_city_logged:
+        tag = (
+            "UNKNOWN_KXTEMP_CITY_CODE" if "TEMP" in prefix_up else
+            "UNKNOWN_KXHIGH_CITY_CODE" if "HIGH" in prefix_up else
+            "UNKNOWN_CITY_CODE"
+        )
+        logger.warning(
+            "%s: raw=%s resolved=%s — not in _CITY_MAP, add to alias map",
+            tag, code, normed,
+        )
+        _unknown_city_logged.add(normed)
+    return normed
+
+
+def _log_alias_startup() -> None:
+    logger.info(
+        "City alias maps loaded — KXHIGH: %d aliases, KXTEMP: %d alias, total: %d",
+        len(_KXHIGH_CITY_ALIAS), len(_KXTEMP_CITY_ALIAS),
+        len(_KXHIGH_CITY_ALIAS) + len(_KXTEMP_CITY_ALIAS),
+    )
+
+
+_log_alias_startup()
+
+
 def _tau_to_bin(tau_hrs: float) -> str:
     if tau_hrs < 6:   return "0-6h"
     if tau_hrs < 12:  return "6-12h"
@@ -163,15 +216,7 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        raw_city = m.group(1).upper()
-        _norm = _KXHIGH_CITY_ALIAS.get(raw_city, raw_city)
-        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
-            logger.warning(
-                "UNKNOWN_KXHIGH_CITY_CODE: ticker=%s suffix=%s — add to _KXHIGH_CITY_ALIAS",
-                ticker, raw_city,
-            )
-            _unknown_city_logged.add(_norm)
-        city = _norm
+        city = normalize_city_code(m.group(1).upper(), market_prefix="KXHIGH")
         date_str, lower = m.group(2).upper(), float(m.group(3))
         return {"type": "HIGH_BAND", "city": city, "date_str": date_str,
                 "lower": lower, "upper": lower + 1.0, "hour": None}
@@ -182,15 +227,7 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        raw_city = m.group(1).upper()
-        _norm = _KXHIGH_CITY_ALIAS.get(raw_city, raw_city)
-        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
-            logger.warning(
-                "UNKNOWN_KXHIGH_CITY_CODE: ticker=%s suffix=%s — add to _KXHIGH_CITY_ALIAS",
-                ticker, raw_city,
-            )
-            _unknown_city_logged.add(_norm)
-        city = _norm
+        city = normalize_city_code(m.group(1).upper(), market_prefix="KXHIGH")
         date_str, thresh = m.group(2).upper(), float(m.group(3))
         return {"type": "HIGH_ABOVE", "city": city, "date_str": date_str,
                 "threshold": thresh, "hour": None}
@@ -201,15 +238,7 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         ticker, re.IGNORECASE
     )
     if m:
-        raw_city = m.group(1).upper()
-        _norm = _KXTEMP_CITY_ALIAS.get(raw_city, raw_city)
-        if _norm not in _CITY_MAP and _norm not in _unknown_city_logged:
-            logger.warning(
-                "UNKNOWN_KXTEMP_CITY_CODE: ticker=%s suffix=%s — add to _KXTEMP_CITY_ALIAS",
-                ticker, raw_city,
-            )
-            _unknown_city_logged.add(_norm)
-        city = _norm
+        city = normalize_city_code(m.group(1).upper(), market_prefix="KXTEMP")
         date_str, hour, thresh = (
             m.group(2).upper(), int(m.group(3)), float(m.group(4))
         )

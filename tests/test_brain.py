@@ -245,5 +245,149 @@ class TestKxtempCityAlias(unittest.TestCase):
                 self.assertIn(result["city"], _CITY_MAP)
 
 
+class TestNormalizeCityCode(unittest.TestCase):
+    """
+    normalize_city_code() and _ticker_city() consistency tests.
+    All pure — no I/O, no network, no DB.
+    """
+
+    def setUp(self):
+        from src.brain.weather_estimator import normalize_city_code, _CITY_MAP
+        self.n = normalize_city_code
+        self.city_map = _CITY_MAP
+
+    # ── Direct _CITY_MAP hits ────────────────────────────────────────────────
+
+    def test_canonical_code_returned_unchanged(self):
+        """Codes already in _CITY_MAP pass through without alias lookup."""
+        for code in ("LAX", "NYC", "TDC", "CHI", "DEN", "MIA", "THOU"):
+            with self.subTest(code=code):
+                self.assertEqual(self.n(code), code)
+                self.assertIn(self.n(code), self.city_map)
+
+    # ── KXHIGH alias resolution ───────────────────────────────────────────────
+
+    def test_kxhigh_tprefix_aliases_all_resolve(self):
+        """Every T-prefix KXHIGH alias maps to a canonical key in _CITY_MAP."""
+        cases = {
+            "TSFO": "SFO", "TPHX": "PHX", "TMIN": "MIN",
+            "TATL": "ATL", "TOKC": "OKC", "TBOS": "BOS",
+            "TSATX": "SAT", "TSEA": "SEA", "TDAL": "DAL",
+            "TNOLA": "NOLA", "TLV": "LV", "NY": "NYC",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                got = self.n(raw, market_prefix="KXHIGH")
+                self.assertEqual(got, expected, f"{raw} -> {got}, expected {expected}")
+                self.assertIn(got, self.city_map)
+
+    def test_aus_alias_resolves(self):
+        """AUS is a new Kalshi city code that maps to itself (present in _CITY_MAP)."""
+        got = self.n("AUS", market_prefix="KXHIGH")
+        self.assertEqual(got, "AUS")
+        self.assertIn(got, self.city_map)
+
+    # ── KXTEMP alias resolution ───────────────────────────────────────────────
+
+    def test_kxtemp_nych_resolves_to_nyc(self):
+        got = self.n("NYCH", market_prefix="KXTEMP")
+        self.assertEqual(got, "NYC")
+        self.assertIn(got, self.city_map)
+
+    # ── No-prefix fallback ────────────────────────────────────────────────────
+
+    def test_no_prefix_searches_both_maps(self):
+        """Without a prefix, both alias maps are searched."""
+        self.assertEqual(self.n("TSFO"), "SFO")   # KXHIGH alias
+        self.assertEqual(self.n("NYCH"), "NYC")   # KXTEMP alias
+
+    # ── Unknown code ──────────────────────────────────────────────────────────
+
+    def test_unknown_code_returns_raw_uppercased(self):
+        """A code absent from both maps is returned unchanged (no crash)."""
+        got = self.n("XXXX", market_prefix="KXHIGH")
+        self.assertEqual(got, "XXXX")
+        self.assertNotIn(got, self.city_map)
+
+    # ── _ticker_city integration ──────────────────────────────────────────────
+
+    def test_ticker_city_tsfo_returns_sfo(self):
+        from src.index import _ticker_city
+        self.assertEqual(_ticker_city("KXHIGHTSFO-26JUN01-B65.5"), "SFO")
+
+    def test_ticker_city_nych_returns_nyc(self):
+        from src.index import _ticker_city
+        self.assertEqual(_ticker_city("KXTEMPNYCH-26JUN0211-T65.99"), "NYC")
+
+    def test_ticker_city_existing_cities_unchanged(self):
+        from src.index import _ticker_city
+        self.assertEqual(_ticker_city("KXHIGHLAX-26JUN01-B74.5"), "LAX")
+        self.assertEqual(_ticker_city("KXHIGHTDC-26JUN02-T79"),   "TDC")
+        self.assertEqual(_ticker_city("KXHIGHCHI-26JUN01-B82.5"), "CHI")
+
+    def test_ticker_city_none_for_unrecognised_prefix(self):
+        from src.index import _ticker_city
+        self.assertIsNone(_ticker_city("KXRAINNYC-26JUN02-T0"))
+        self.assertIsNone(_ticker_city("KXFIRSTHURRICANE-26DEC01-T3"))
+
+    # ── Slot key consistency ──────────────────────────────────────────────────
+
+    def test_slot_key_tsfo_matches_sfo(self):
+        """KXHIGHTSFO and KXHIGHSFO produce the same city_date slot key."""
+        from src.index import _ticker_city, _ticker_date
+        tsfo_city = _ticker_city("KXHIGHTSFO-26JUN01-B65.5")
+        sfo_city  = _ticker_city("KXHIGHSFO-26JUN01-B65.5")
+        date      = _ticker_date("KXHIGHTSFO-26JUN01-B65.5")
+        self.assertEqual(tsfo_city, sfo_city)
+        self.assertEqual(f"{tsfo_city}_{date}", f"{sfo_city}_{date}")
+
+    def test_held_slots_tsfo_would_block_sfo_candidate(self):
+        """
+        A held TSFO position and a new SFO candidate land in the same slot —
+        the concentration guard would treat them as the same city.
+        """
+        from src.index import _ticker_city, _ticker_date
+        held = "KXHIGHTSFO-26JUN01-B65.5"
+        new  = "KXHIGHSFO-26JUN01-B67.5"
+        self.assertEqual(
+            f"{_ticker_city(held)}_{_ticker_date(held)}",
+            f"{_ticker_city(new)}_{_ticker_date(new)}",
+        )
+
+    # ── City guard and attribution use normalized city ────────────────────────
+
+    def test_city_guard_receives_normalized_city(self):
+        """
+        The city code reaching city_guard.check() is the normalized form.
+        Verified indirectly: _parse_ticker normalizes before posterior is built,
+        and posterior['city'] is what city_guard.check() receives.
+        """
+        from src.brain.weather_estimator import _parse_ticker, _CITY_MAP
+        result = _parse_ticker("KXHIGHTSFO-26JUN01-B65.5")
+        self.assertIsNotNone(result)
+        city = result["city"]
+        self.assertEqual(city, "SFO")
+        self.assertIn(city, _CITY_MAP)
+
+    def test_attribution_city_normalized(self):
+        """
+        Trade attribution writes posterior['city'] — confirm it's normalized
+        for all ticker types.
+        """
+        from src.brain.weather_estimator import _parse_ticker
+        cases = [
+            ("KXHIGHTSFO-26JUN01-B65.5",    "SFO"),
+            ("KXTEMPNYCH-26JUN0211-T65.99",  "NYC"),
+            ("KXHIGHNY-26JUN01-T75",         "NYC"),
+            ("KXHIGHTDAL-26JUN01-B95.5",     "DAL"),
+            ("KXHIGHLAX-26JUN01-B74.5",      "LAX"),
+        ]
+        for ticker, expected_city in cases:
+            with self.subTest(ticker=ticker):
+                parsed = _parse_ticker(ticker)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed["city"], expected_city)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

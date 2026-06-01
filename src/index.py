@@ -22,7 +22,8 @@ from src.layer2.particle_filter import TemperatureParticleFilter
 from src.layer2.gating_logic import TradeGating
 from src.brain.weather_estimator import (
     estimate_p_yes, get_ar1_metadata, get_forecast_temp_for_ticker,
-    load_city_params, _CITY_MAP, _FORECAST_SIGMA_F, _AR1_PHI, _parse_ticker
+    load_city_params, _CITY_MAP, _FORECAST_SIGMA_F, _AR1_PHI, _parse_ticker,
+    normalize_city_code,
 )
 from analytics.cycle_diagnostics import CycleDiagnostics, compute_strike_z
 
@@ -58,9 +59,11 @@ EXIT_EXPIRY_CLEANUP_TAU_HRS = 2.0
 
 
 def _ticker_city(ticker: str) -> Optional[str]:
-    """KXHIGHCHI-26APR21-T73 → 'CHI'"""
-    m = _re.match(r"KX(?:HIGH|TEMP)([A-Z]+)-", ticker, _re.IGNORECASE)
-    return m.group(1).upper() if m else None
+    """Return the normalized _CITY_MAP key for a KXHIGH/KXTEMP ticker."""
+    m = _re.match(r"KX(HIGH|TEMP)([A-Z]+)-", ticker, _re.IGNORECASE)
+    if not m:
+        return None
+    return normalize_city_code(m.group(2).upper(), market_prefix="KX" + m.group(1).upper())
 
 
 def _ticker_date(ticker: str) -> Optional[str]:
