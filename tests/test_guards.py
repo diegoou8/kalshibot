@@ -217,6 +217,74 @@ class TestCityRiskGuard:
         assert allowed is True
         assert mult == pytest.approx(1.0)
 
+    # ── Paper-mode Brier throttle (new behaviour) ─────────────────────────────
+
+    def _mock_db(self, brier: float, n: int, tail_count: int = 0):
+        """Return a MagicMock DB that reports a single city's Brier and tail count."""
+        db = MagicMock()
+        db.get_rolling_brier_by_city.return_value = (brier, n)
+        db.get_tail_risk_count.return_value = tail_count
+        return db
+
+    def test_paper_mode_brier_block_becomes_throttle(self, tmp_path):
+        """PAPER mode: Brier >= 0.25 → 0.25× throttle, NO 24h block."""
+        from src.risk.city_guard import CityRiskGuard, PAPER_BRIER_THROTTLE
+        db = self._mock_db(brier=0.40, n=15)
+        guard = self._make_guard(tmp_path)
+        guard.refresh(db, ["MIA"], env_mode="PAPER")
+        allowed, mult = guard.check("MIA")
+        assert allowed is True, "city must not be blocked in PAPER mode"
+        assert mult == pytest.approx(PAPER_BRIER_THROTTLE)
+        assert not guard.is_blocked("MIA"), "is_blocked must be False in PAPER mode"
+
+    def test_live_mode_brier_still_blocks(self, tmp_path):
+        """LIVE mode: Brier >= 0.25 → 24h block (existing behaviour unchanged)."""
+        from src.risk.city_guard import CityRiskGuard
+        db = self._mock_db(brier=0.40, n=15)
+        guard = self._make_guard(tmp_path)
+        guard.refresh(db, ["MIA"], env_mode="LIVE")
+        allowed, mult = guard.check("MIA")
+        assert allowed is False
+        assert mult == pytest.approx(0.0)
+        assert guard.is_blocked("MIA")
+
+    def test_paper_mode_releases_existing_block_on_refresh(self, tmp_path):
+        """PAPER mode refresh clears a prior block so calibration can resume."""
+        from src.risk.city_guard import CityRiskGuard, PAPER_BRIER_THROTTLE
+        db = self._mock_db(brier=0.40, n=15)
+        guard = self._make_guard(tmp_path)
+        # Manually inject an active block (as if set by a previous live-mode run)
+        future_until = (_utcnow() + timedelta(hours=12)).isoformat()
+        guard._blocks["TDC"] = future_until
+        guard._save()
+        assert guard.is_blocked("TDC")  # sanity: block is active before refresh
+
+        guard.refresh(db, ["TDC"], env_mode="PAPER")
+        allowed, mult = guard.check("TDC")
+        assert allowed is True, "prior block must be released in PAPER mode"
+        assert mult == pytest.approx(PAPER_BRIER_THROTTLE)
+        assert not guard.is_blocked("TDC")
+
+    def test_paper_mode_tail_risk_still_blocks(self, tmp_path):
+        """PAPER mode: tail-risk guard still blocks (severity justifies it)."""
+        from src.risk.city_guard import CityRiskGuard
+        db = self._mock_db(brier=0.40, n=15, tail_count=2)
+        guard = self._make_guard(tmp_path)
+        guard.refresh(db, ["LAX"], env_mode="PAPER")
+        allowed, mult = guard.check("LAX")
+        assert allowed is False
+        assert guard.is_blocked("LAX")
+
+    def test_paper_mode_brier_throttle_below_block_unchanged(self, tmp_path):
+        """PAPER mode: Brier in [0.20, 0.25) still gets 0.5× (not paper throttle)."""
+        from src.risk.city_guard import CityRiskGuard
+        db = self._mock_db(brier=0.22, n=12)
+        guard = self._make_guard(tmp_path)
+        guard.refresh(db, ["CHI"], env_mode="PAPER")
+        allowed, mult = guard.check("CHI")
+        assert allowed is True
+        assert mult == pytest.approx(0.5)
+
 
 # ── 6. Concentration guard ────────────────────────────────────────────────────
 

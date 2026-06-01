@@ -8,9 +8,15 @@ State is persisted to data/city_blocks.json so blocks survive process restarts.
 Thresholds (all tunable via constants):
   Brier < 0.20, n >= MIN_OBS  → full sizing (1.0×)
   0.20 <= Brier < 0.25        → throttled sizing (0.5×), log BRIER_THROTTLE_APPLIED
-  Brier >= 0.25, n >= MIN_OBS → 24h block, log BLOCKED_CITY_BRIER_GUARD
-  Tail risk (p<5% but YES, 2+ cases in last 20) → immediate 24h block, BLOCKED_CITY_TAIL_RISK
+  Brier >= 0.25, n >= MIN_OBS → see env_mode below:
+    LIVE  → 24h block,             log BLOCKED_CITY_BRIER_GUARD
+    PAPER → 0.25× sizing throttle, log CITY_THROTTLED_PAPER_MODE  (no block)
+  Tail risk (p<5% but YES, 2+ cases in last 20) → immediate 24h block regardless of mode
   n < MIN_OBS                 → monitor only, never block
+
+PAPER-mode rationale: blocking deadlocks the calibration loop — cities can never
+collect new settled trades to lower their Brier.  A heavy throttle (0.25×) keeps
+the city trading at minimal size while letting calibration data accumulate.
 """
 import json
 import logging
@@ -28,6 +34,9 @@ MIN_OBS: int = 10
 BLOCK_HOURS: int = 24
 TAIL_RISK_THRESHOLD: int = 2
 TAIL_RISK_P_THRESHOLD: float = 0.05
+# Heavy throttle applied instead of a 24h block when running in PAPER/demo mode.
+# Keeps the city active at minimal size so calibration data can accumulate.
+PAPER_BRIER_THROTTLE: float = 0.25
 
 
 class CityRiskGuard:
@@ -89,21 +98,36 @@ class CityRiskGuard:
 
     # ── Evaluation ───────────────────────────────────────────────────────────
 
-    def refresh(self, db, cities: List[str]) -> None:
+    def refresh(self, db, cities: List[str], env_mode: str = "PAPER") -> None:
         """
         Evaluate each city and update block/throttle state.
         Must be called once per trade cycle before any check() calls.
 
-        db: DWTraderDB instance
-        cities: list of city codes to evaluate (e.g. list(_CITY_MAP.keys()))
+        db:       DWTraderDB instance
+        cities:   list of city codes to evaluate (e.g. list(_CITY_MAP.keys()))
+        env_mode: execution mode string — "LIVE" enables 24h Brier blocks;
+                  any other value (PAPER, DEMO, …) uses a 0.25× throttle instead.
         """
+        _is_live = env_mode.upper() == "LIVE"
         self._expire_blocks()
         self._throttle = {city: 1.0 for city in cities}
 
         for city in cities:
             if self.is_blocked(city):
-                self._throttle[city] = 0.0
-                continue
+                if not _is_live:
+                    # Paper mode: release any existing block and fall through to the
+                    # normal Brier evaluation below.  The block was likely set by a
+                    # previous run that used the live-mode code path; in paper mode
+                    # we throttle instead so calibration data can keep accumulating.
+                    del self._blocks[city]
+                    self._save()
+                    logger.info(
+                        "CITY_UNBLOCKED_PAPER_MODE: %s — prior block released, re-evaluating",
+                        city,
+                    )
+                else:
+                    self._throttle[city] = 0.0
+                    continue
 
             brier, n = db.get_rolling_brier_by_city(city, window=30, min_obs=MIN_OBS)
 
@@ -111,7 +135,8 @@ class CityRiskGuard:
                 # Not enough data — monitor only, never block
                 continue
 
-            # Tail risk guard — checked before Brier block (more severe signal)
+            # Tail risk guard — checked before Brier block (more severe signal).
+            # Blocks in all modes: tail risk is an immediate safety signal.
             tail_count = db.get_tail_risk_count(
                 city, window=20, p_threshold=TAIL_RISK_P_THRESHOLD
             )
@@ -126,8 +151,20 @@ class CityRiskGuard:
                 continue
 
             if brier >= BRIER_BLOCK:
-                self.block_city(city, "BRIER_GUARD")
-                self._throttle[city] = 0.0
+                if _is_live:
+                    # In live mode: hard 24h block protects real capital.
+                    self.block_city(city, "BRIER_GUARD")
+                    self._throttle[city] = 0.0
+                else:
+                    # In paper/demo mode: throttle to 0.25× instead of blocking.
+                    # Blocking deadlocks calibration — city can never settle new trades
+                    # to lower its Brier.  0.25× keeps it active at minimal size.
+                    self._throttle[city] = PAPER_BRIER_THROTTLE
+                    logger.info(
+                        "CITY_THROTTLED_PAPER_MODE: %s brier=%.3f (n=%d) → %.2f× sizing"
+                        " (no 24h block in paper mode)",
+                        city, brier, n, PAPER_BRIER_THROTTLE,
+                    )
                 continue
 
             if brier >= BRIER_THROTTLE:

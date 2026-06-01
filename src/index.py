@@ -281,7 +281,7 @@ async def trade_cycle(env_mode: str):
     # Adaptive city risk guard: evaluates rolling Brier per city, sets blocks/throttles.
     # refresh() queries DB once per cycle; check() is fast (dict lookup).
     city_guard = CityRiskGuard()
-    city_guard.refresh(db, list(_CITY_MAP.keys()))
+    city_guard.refresh(db, list(_CITY_MAP.keys()), env_mode)
 
     current_balance = Config.BANKROLL
 
