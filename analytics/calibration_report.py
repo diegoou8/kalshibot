@@ -21,7 +21,7 @@ Run daily, then submit to OpenAI / NotebookLM on Apr 30.
 """
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -70,7 +70,24 @@ def _h(title: str) -> None:
 
 # ── data collection ───────────────────────────────────────────────────────────
 
-def _collect(conn, window: str) -> dict:
+def _ds(val) -> str:
+    """Convert datetime, date, or ISO string to 'YYYY-MM-DD'. Safe for Azure SQL and SQLite."""
+    if val is None:
+        return ""
+    if hasattr(val, "strftime"):
+        return val.strftime("%Y-%m-%d")
+    return str(val)[:10]
+
+
+def _query(conn, sql: str, params: tuple = ()) -> List[dict]:
+    """Execute sql and return rows as list of dicts (works with pyodbc + Azure SQL)."""
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def _collect(conn, cutoff: str) -> dict:
     """Run all queries against populated tables and return plain-dict result sets."""
     import re as _re
 
@@ -82,24 +99,25 @@ def _collect(conn, window: str) -> dict:
 
     # Filled orders: orders JOIN executions — include gumbel_mode from orders column,
     # fall back to schedule lookup for rows that predate the column.
-    filled_rows = conn.execute(
+    fills = _query(
+        conn,
         """
         SELECT o.order_id, o.ticker, o.side, o.price_cents, o.qty, o.status,
                o.created_at, e.execution_id, e.lvr_cents, e.price_cents AS exec_price,
                o.gumbel_mode
         FROM orders o
         JOIN executions e ON e.order_id = o.order_id
-        WHERE DATE(o.created_at) >= date('now', ?)
+        WHERE CAST(o.created_at AS DATE) >= ?
         """,
-        (window,),
-    ).fetchall()
-    fills = [dict(r) for r in filled_rows]
+        (cutoff,),
+    )
 
     # Closed/settled positions — include both statuses.
     # gumbel_mode column is the authoritative source; fall back to schedule date for old rows.
     # For 'settled' rows where realized_pnl_cents was never booked (= 0),
     # fall back to unrealized_pnl_cents which reflects the last mark before expiry.
-    closed_rows = conn.execute(
+    closed_positions = _query(
+        conn,
         """
         SELECT position_id, ticker, side, qty, avg_price_cents,
                CASE
@@ -113,54 +131,53 @@ def _collect(conn, window: str) -> dict:
                gumbel_mode
         FROM positions
         WHERE status IN ('closed', 'settled')
-          AND DATE(updated_at) >= date('now', ?)
+          AND CAST(updated_at AS DATE) >= ?
         """,
-        (window,),
-    ).fetchall()
-    closed_positions = [dict(r) for r in closed_rows]
+        (cutoff,),
+    )
 
     # Settled predictions
-    pred_rows = conn.execute(
+    settled_preds = _query(
+        conn,
         """
         SELECT prediction_id, ticker, trade_date, side, predicted_p,
                actual_outcome, brier_score, city, recorded_at
         FROM predictions
         WHERE actual_outcome IS NOT NULL
           AND brier_score IS NOT NULL
-          AND recorded_at >= date('now', ?)
+          AND recorded_at >= ?
         """,
-        (window,),
-    ).fetchall()
-    settled_preds = [dict(r) for r in pred_rows]
+        (cutoff,),
+    )
 
     # Scans — fetch only those whose ticker appears in fills (avoid cartesian)
     fill_tickers = set(f["ticker"] for f in fills)
     scan_rows: List[dict] = []
     if fill_tickers:
         placeholders = ",".join("?" * len(fill_tickers))
-        raw_scans = conn.execute(
+        scan_rows = _query(
+            conn,
             f"""
             SELECT ticker, market_probability, ml_probability, timestamp
             FROM scans
-            WHERE timestamp >= date('now', ?)
+            WHERE timestamp >= ?
               AND ticker IN ({placeholders})
             """,
-            (window, *fill_tickers),
-        ).fetchall()
-        scan_rows = [dict(r) for r in raw_scans]
+            (cutoff, *fill_tickers),
+        )
 
     # ── 2. Helper: assign gumbel_mode from _SCHEDULE by date string ──────────
 
-    def _mode_for_date(date_str: str) -> Optional[str]:
-        """Return mode for 'YYYY-MM-DD' or None if not in schedule."""
-        return _SCHEDULE.get(date_str[:10])
+    def _mode_for_date(date_str) -> Optional[str]:
+        """Return mode for a date value (string, date, or datetime) or None if not in schedule."""
+        return _SCHEDULE.get(_ds(date_str))
 
     # ── 3. Build fill-date → mode index ──────────────────────────────────────
 
     # fills keyed by (ticker, date) for scan join
     fills_by_ticker_date: Dict[str, set] = {}
     for f in fills:
-        date_str = f["created_at"][:10]
+        date_str = _ds(f["created_at"])
         fills_by_ticker_date.setdefault(f["ticker"], set()).add(date_str)
 
     # ── 4. exp: per-mode fill counts + avg Brier from settled predictions ─────
@@ -168,7 +185,7 @@ def _collect(conn, window: str) -> dict:
     # index settled_preds by trade_date for quick lookup
     pred_by_date: Dict[str, List[dict]] = {}
     for p in settled_preds:
-        pred_by_date.setdefault(p["trade_date"], []).append(p)
+        pred_by_date.setdefault(_ds(p["trade_date"]), []).append(p)
 
     # group fills by mode — prefer stored gumbel_mode column, fall back to schedule date
     fills_by_mode: Dict[str, List[dict]] = {}
@@ -206,9 +223,9 @@ def _collect(conn, window: str) -> dict:
         mode = f.get("gumbel_mode") or _mode_for_date(f["created_at"])
         if mode is None:
             continue
-        f_date = f["created_at"][:10]
+        f_date = _ds(f["created_at"])
         for s in scan_by_ticker.get(f["ticker"], []):
-            if s["timestamp"][:10] != f_date:
+            if _ds(s["timestamp"]) != f_date:
                 continue
             ml_p  = s["ml_probability"]
             mkt_p = s["market_probability"]
@@ -278,7 +295,7 @@ def _collect(conn, window: str) -> dict:
         if city is None:
             continue
         # Only include if this ticker appears in any fill on the same date
-        s_date = s["timestamp"][:10]
+        s_date = _ds(s["timestamp"])
         ticker_fills_dates = fills_by_ticker_date.get(s["ticker"], set())
         if s_date not in ticker_fills_dates:
             continue
@@ -351,14 +368,14 @@ def _collect(conn, window: str) -> dict:
 
     daily: List[dict] = []
     for date_str, mode in sorted(_SCHEDULE.items()):
-        day_fills = [f for f in fills if f["created_at"][:10] == date_str]
+        day_fills = [f for f in fills if _ds(f["created_at"]) == date_str]
         total_trades = len(day_fills)
         yes_trades   = sum(1 for f in day_fills if f["side"] == "yes")
         no_trades    = sum(1 for f in day_fills if f["side"] != "yes")
         day_preds = pred_by_date.get(date_str, [])
         brier_vals = [p["brier_score"] for p in day_preds if p["brier_score"] is not None]
         brier_score = sum(brier_vals) / len(brier_vals) if brier_vals else None
-        day_poss = [p for p in closed_positions if p["updated_at"][:10] == date_str]
+        day_poss = [p for p in closed_positions if _ds(p["updated_at"]) == date_str]
         realized_pnl_cents = sum(p["realized_pnl_cents"] or 0 for p in day_poss) if day_poss else None
         daily.append({
             "run_date": date_str, "gumbel_mode": mode,
@@ -386,10 +403,10 @@ def _collect(conn, window: str) -> dict:
 
 def run_report(days: int = 3) -> None:
     db = DWTraderDB()
-    window = f"-{days} days"
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
 
     with db.get_connection() as conn:
-        raw = _collect(conn, window)
+        raw = _collect(conn, cutoff)
 
     # ── build mode_data ───────────────────────────────────────────────────────
     exp_m  = {r["gumbel_mode"]: dict(r) for r in raw["exp"]}
