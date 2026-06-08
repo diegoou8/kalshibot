@@ -987,3 +987,133 @@ The report footer auto-generates this prompt. Use it verbatim:
 > *3. Are tail-risk levels acceptable?*
 > *4. Which horizon or strike bucket has the most real edge?*
 > *5. Single highest-priority fix before going live?*"
+
+---
+
+## Session: 2026-06-07 — Pre-experiment hardening + backtest framework
+
+### Context
+Gumbel A/B/C Phase 3 is running. Today is the first day of the `none` window (Jun 7–9).
+The experiment ends Jun 12. Phase 3 schedule: `half` Jun 4–6, `none` Jun 7–9, `full` Jun 10–12.
+
+### What We Fixed Before the Experiment Ends
+
+**1. Weather ingestion timeouts** (`src/ingest/weather.py`, commit a9e2453)
+Root cause of 0 fills on `none` experiment days: per-request aiohttp sessions + sequential city fetches
+meant one timeout starved the rest. Fixed:
+- Persistent `_session` (created lazily, reused across calls)
+- `_fetch_with_retry()` with exponential backoff (2s / 4s / 8s) on transient errors
+- All 19 cities fetched in parallel via `asyncio.gather()` in `bot_runner.py`
+
+**2. WebSocket exponential backoff** (`src/ingest/ws_client.py`, commit 6163f28)
+Replaced fixed 5s reconnect with: base=5s → max=80s, mult=2.0×, ±25% jitter.
+503 errors get specific log tag. Backoff resets on successful connection.
+
+**3. Calibration report Azure SQL compatibility** (`analytics/calibration_report.py`, commit 3c984b8)
+Three errors fixed: `DATE()` → `CAST(col AS DATE)`, pyodbc row → dict via `cursor.description`,
+`datetime[:10]` slicing → `_ds()` helper. Report now runs end-to-end on Azure SQL.
+
+**4. Experiment-safe Brier auto-block** (`src/risk/city_guard.py`, commit 0932482)
+Added `BRIER_BLOCK_ENABLED` flag read from `bot_config` table at each cycle.
+- Default (unset / `false`): all Brier throttling skipped, only tail-risk blocks apply.
+  Logs `BRIER_BLOCK_CANDIDATE` so candidates are visible without acting on them.
+- `true`: activates full throttle/block logic (existing behavior).
+Tail-risk blocks apply regardless — they are a safety signal, not an experiment concern.
+
+**5. Backtest framework** (`scripts/backtest.py`, commit 0932482)
+New CLI: `python scripts/backtest.py [--days N] [--mode half/none/full] [--env PAPER] [--csv FILE]`
+Sections: fill stats, experiment runs by mode, daily PnL + Sharpe + max drawdown,
+Brier by Gumbel mode, Brier by city, PnL by city.
+
+**6. AdaptiveBiasFilter — confirmed already wired** (no code change needed)
+Suspected orphaned but actually live in `src/brain/weather_estimator.py`:
+- `_adaptive_bias.update()` called in `_fetch_ar1_correction()` every cycle
+- `_adaptive_bias.correction(city_code)` applied in `estimate_p_yes()`
+
+### Backtest Test Run (2026-06-07, --days 30)
+
+```
+Fills:   360 total  (yes=227 avg 20.9c, no=133 avg 48.2c)
+PnL:     -$82.36 across 129 settled positions (positions table fallback)
+```
+
+Brier by city (no mode filter, all settled predictions):
+| City | n | Brier |
+|------|---|-------|
+| NY   | 2 | 0.826 *** |
+| LAX  | 221 | 0.643 *** |
+| NYC  | 51 | 0.618 *** |
+| TDC  | 71 | 0.538 *** |
+| PHIL | 82 | 0.491 *** |
+| DEN  | 94 | 0.215 |
+| THOU | 23 | 0.190 |
+| MIA  | 3  | 0.109 |
+
+**Known data gaps found:**
+- `trade_attribution` is empty — per-city PnL and daily timeline unavailable until wired
+- Brier by mode join inflated (19k rows for `half` — cartesian product bug in query)
+
+### Architecture Status (2026-06-07)
+
+| Component | Status |
+|-----------|--------|
+| Weather ingestion | ✅ Persistent session + backoff + parallel |
+| WebSocket reconnect | ✅ Exp. backoff 5→80s + jitter |
+| Calibration report (Azure SQL) | ✅ All SQL + pyodbc bugs fixed |
+| Brier auto-block (experiment-safe) | ✅ BRIER_BLOCK_ENABLED flag wired |
+| Backtest framework | ✅ `scripts/backtest.py` — runs clean |
+| AdaptiveBiasFilter | ✅ Confirmed live in weather_estimator.py |
+| trade_attribution populate | ❌ Table empty — TradeLogger not writing to it |
+| Backtest Brier-by-mode join | ⚠️ Inflated counts — needs DISTINCT subquery fix |
+| DEN/THOU YES bias | ⚠️ avg_edge still +15c (ongoing) |
+
+---
+
+## Next Session Plan: 2026-06-13 (post-experiment)
+
+Run these in order on June 13. Do not change anything before June 12.
+
+### Step 1 — Read the experiment data
+```bash
+python analytics/calibration_report.py --days 9     # Phase 3 side-by-side
+python scripts/backtest.py --days 30 --csv jun13.csv # full 30-day summary
+```
+
+### Step 2 — Pick winning Gumbel mode
+Compare `none` vs `half` vs `full` on Brier, fill count, and PnL.
+Lock the winner:
+```bash
+python scripts/set_gumbel_mode.py <mode>
+```
+
+### Step 3 — Enable Brier blocking
+```sql
+-- run directly or via a scripts/ helper
+UPDATE bot_config SET value='true', updated_at=GETDATE()
+WHERE config_key='BRIER_BLOCK_ENABLED';
+```
+Cities currently flagged as candidates: LAX (0.64), NYC (0.62), TDC (0.54).
+These will be throttled or blocked once the flag is on.
+
+### Step 4 — Fix trade_attribution not being written
+`src/logging/trade_logger.py::log_execution_fill()` — confirm the INSERT to
+`trade_attribution` is firing. Without this, backtest PnL by city stays dark.
+Check with: `SELECT COUNT(*) FROM trade_attribution`
+
+### Step 5 — Investigate DEN/THOU YES bias
+```bash
+python analytics/calibration_report.py --days 30   # check city-level avg_edge
+```
+If avg_edge > +0.05 persists for DEN/THOU under the winning mode:
+add a per-city fixed offset dict in `src/brain/weather_estimator.py::estimate_p_yes()`
+alongside `_adaptive_bias.correction()`.
+
+### Step 6 — Fix backtest Brier-by-mode join inflation
+`scripts/backtest.py::_section_brier_by_mode` — join predictions→orders on ticker+date
+creates a cartesian product when multiple orders share a ticker on the same day.
+Fix: deduplicate predictions first in a subquery before aggregating.
+
+### Step 7 — Recalibrate Kelly multiplier
+Once 30+ settled trades exist under the winning mode:
+- Brier < 0.20 → bump `kelly_multiplier` in `src/index.py` from 0.25 → 0.35
+- Brier ≥ 0.25 → investigate calibration before changing
