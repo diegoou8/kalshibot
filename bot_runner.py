@@ -101,15 +101,19 @@ async def _bootstrap_historical(db: DWTraderDB) -> None:
 
 
 async def _run_weather_loop(db: DWTraderDB) -> None:
-    """Poll Open-Meteo forecasts for all cities every hour."""
+    """Poll Open-Meteo forecasts for all cities every hour, all cities in parallel."""
     weather = WeatherIngestor(db)
+    cities  = list(Config.CITY_COORDS.keys())
     while True:
-        try:
-            for city in Config.CITY_COORDS.keys():
-                await weather.ingest_forecast_data(city)
-            logger.info("Weather ingestion complete for all cities.")
-        except Exception as exc:
-            logger.error("Weather ingestion error: %s", exc)
+        results = await asyncio.gather(
+            *[weather.ingest_forecast_data(city) for city in cities],
+            return_exceptions=True,
+        )
+        n_fail = sum(1 for r in results if isinstance(r, Exception))
+        if n_fail:
+            logger.warning("Weather ingestion: %d/%d cities failed after retries", n_fail, len(cities))
+        else:
+            logger.info("Weather ingestion complete for all %d cities.", len(cities))
         await asyncio.sleep(3600)
 
 
