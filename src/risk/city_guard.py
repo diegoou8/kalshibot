@@ -107,7 +107,21 @@ class CityRiskGuard:
         cities:   list of city codes to evaluate (e.g. list(_CITY_MAP.keys()))
         env_mode: execution mode string — "LIVE" enables 24h Brier blocks;
                   any other value (PAPER, DEMO, …) uses a 0.25× throttle instead.
+
+        When the bot_config key BRIER_BLOCK_ENABLED is not set to "true" (the default
+        during the Gumbel A/B/C experiment window through Jun 12 2026), all Brier-based
+        throttling is skipped — only tail-risk blocks apply.  This preserves full-sized
+        positions for all cities so experiment data is not cut short.  Flip the flag to
+        "true" post-experiment to activate per-city Brier blocks.
         """
+        # Read experiment-safe flag from DB (default False until explicitly enabled).
+        brier_block_enabled = False
+        try:
+            raw = db.get_config("BRIER_BLOCK_ENABLED")
+            brier_block_enabled = (raw or "").lower() == "true"
+        except Exception as _e:
+            logger.warning("CityRiskGuard: could not read BRIER_BLOCK_ENABLED: %s", _e)
+
         _is_live = env_mode.upper() == "LIVE"
         self._expire_blocks()
         self._throttle = {city: 1.0 for city in cities}
@@ -136,7 +150,8 @@ class CityRiskGuard:
                 continue
 
             # Tail risk guard — checked before Brier block (more severe signal).
-            # Blocks in all modes: tail risk is an immediate safety signal.
+            # Applies regardless of brier_block_enabled: tail risk is a safety signal
+            # that should fire even during the experiment window.
             tail_count = db.get_tail_risk_count(
                 city, window=20, p_threshold=TAIL_RISK_P_THRESHOLD
             )
@@ -148,6 +163,24 @@ class CityRiskGuard:
                 )
                 self.block_city(city, "TAIL_RISK")
                 self._throttle[city] = 0.0
+                continue
+
+            # Brier-based throttle/block — only active when BRIER_BLOCK_ENABLED=true.
+            # During the experiment window this is skipped so all cities trade at full
+            # size regardless of Brier, preserving data for post-experiment analysis.
+            if not brier_block_enabled:
+                if brier >= BRIER_BLOCK:
+                    logger.info(
+                        "BRIER_BLOCK_CANDIDATE: %s brier=%.3f (n=%d) — block deferred"
+                        " (BRIER_BLOCK_ENABLED=false, experiment window)",
+                        city, brier, n,
+                    )
+                elif brier >= BRIER_THROTTLE:
+                    logger.debug(
+                        "BRIER_THROTTLE_CANDIDATE: %s brier=%.3f (n=%d) — throttle deferred"
+                        " (BRIER_BLOCK_ENABLED=false)",
+                        city, brier, n,
+                    )
                 continue
 
             if brier >= BRIER_BLOCK:
