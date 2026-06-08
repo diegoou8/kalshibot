@@ -28,18 +28,10 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.db.dwtrader import DWTraderDB
+from src.config.experiment import GUMBEL_SCHEDULE as _SCHEDULE
 
 _SEP  = "-" * 80
 _SEP2 = "=" * 80
-
-# A/B/C schedule: which mode runs on which date
-_SCHEDULE: Dict[str, str] = {
-    "2026-04-28": "half",
-    "2026-04-29": "none",
-    "2026-04-30": "full",
-    "2026-05-04": "none",
-    "2026-05-05": "none",
-}
 
 _CONFIDENCE_MIN_SETTLED = 30  # fewer => LOW_CONFIDENCE flag
 

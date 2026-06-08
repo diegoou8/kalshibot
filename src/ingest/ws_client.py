@@ -1,12 +1,18 @@
 import asyncio
 import json
 import logging
+import random
 from typing import Any, Dict, List, Set
 
 from ..db.dwtrader import DWTraderDB
 from ..config.env import Config
 
 logger = logging.getLogger(__name__)
+
+_WS_BACKOFF_BASE  = 5    # seconds
+_WS_BACKOFF_MAX   = 80   # seconds — cap so we don't wait longer than ~1.5 min
+_WS_BACKOFF_MULT  = 2.0
+_WS_JITTER_FRAC   = 0.25  # ±25% of the delay
 
 
 class IngestionPipeline:
@@ -123,6 +129,7 @@ class KalshiWebSocketClient:
         self.client = client  # optional KalshiClient instance used for signing
         self._running = False
         self._weather_tickers: Set[str] = set()
+        self._reconnect_delay = _WS_BACKOFF_BASE
 
     @staticmethod
     def _is_weather_market(m: Dict[str, Any]) -> bool:
@@ -185,6 +192,9 @@ class KalshiWebSocketClient:
                     headers = self.client._get_headers("GET", "/trade-api/ws/v2")
                     
                 async with websockets.connect(self.uri, additional_headers=headers) as ws:
+                    # Connection succeeded — reset backoff.
+                    self._reconnect_delay = _WS_BACKOFF_BASE
+
                     # Subscribe to ticker updates (we'll filter to weather markets client-side).
                     ticker_sub = {
                         "id": 1,
@@ -291,8 +301,23 @@ class KalshiWebSocketClient:
                     finally:
                         refresher.cancel()
             except Exception as conn_exc:
-                logger.warning("websocket connection failed: %s, retrying in 5s", conn_exc)
-                await asyncio.sleep(5)
+                is_503 = "503" in str(conn_exc) or "Service Unavailable" in str(conn_exc)
+                jitter  = random.uniform(-_WS_JITTER_FRAC, _WS_JITTER_FRAC) * self._reconnect_delay
+                wait    = self._reconnect_delay + jitter
+                if is_503:
+                    logger.warning(
+                        "WebSocket 503 (server overloaded) — retrying in %.1fs (backoff=%ds)",
+                        wait, self._reconnect_delay,
+                    )
+                else:
+                    logger.warning(
+                        "WebSocket connection failed: %s — retrying in %.1fs (backoff=%ds)",
+                        conn_exc, wait, self._reconnect_delay,
+                    )
+                self._reconnect_delay = min(
+                    int(self._reconnect_delay * _WS_BACKOFF_MULT), _WS_BACKOFF_MAX
+                )
+                await asyncio.sleep(wait)
 
     def stop(self) -> None:
         self._running = False
