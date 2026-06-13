@@ -14,6 +14,9 @@ from src.config.env import Config
 from src.decision.engine import DecisionEngine, _kalshi_fee_per_contract
 from src.risk.manager import RiskManager
 from src.risk.city_guard import CityRiskGuard
+from src.risk.segment_guard import SegmentGuard
+from src.risk.contract_audit import audit_and_store, get_verified_contract_semantics
+from src.types import ContractSemantics
 from src.execution.manager import ExecutionManager
 from src.logging.trade_logger import TradeLogger
 from src.brain.logit_jd import LogitJumpDiffusionBrain
@@ -189,8 +192,10 @@ async def _build_posterior(
 ) -> Dict[str, Any]:
     """
     Build a posterior dict for the brain.
-    Tries to get an independent weather-based P(YES) from Open-Meteo.
-    Falls back to high-uncertainty defaults when the ticker is unrecognised.
+
+    Calls get_verified_contract_semantics(ticker, m) to resolve direction
+    from the live Kalshi market dict (which contains strike_type).
+    Returns semantics in the posterior so Phase 1d can enforce fail-closed.
 
     city_params: per-city calibrated {sigma, phi} from load_city_params().
     When absent or a city has < 14 days of data, module defaults are used.
@@ -208,22 +213,43 @@ async def _build_posterior(
             pass
 
     ticker = m.get("ticker", "")
-    city   = _ticker_city(ticker)
+
+    # Build verified semantics from the live Kalshi market dict.
+    # m is from get_weather_markets() and includes strike_type/floor_strike/cap_strike.
+    # For T-type daily markets: verified=True when strike_type is present.
+    # For BAND/HOURLY: verified=True always (direction unambiguous from ticker).
+    try:
+        semantics: Optional[ContractSemantics] = get_verified_contract_semantics(ticker, m)
+    except Exception as _sem_exc:
+        logger.warning("ContractSemantics build failed for %s: %s", ticker, _sem_exc)
+        semantics = None
+
+    city = (semantics.canonical_city if semantics else None) or _ticker_city(ticker)
+
+    # Early exit: Phase 1d enforces fail-closed on semantics.verified=False
+    if semantics is None or not semantics.verified:
+        return {
+            "P_adj_YES":       None,
+            "semantics":       semantics,
+            "posterior_var_T": 0.0,
+            "pf_ess":          0.0,
+            "tau_hrs":         tau_hrs,
+            "pi_stale":        1.0,
+            "city":            city,
+            "ar1_correction":  0.0,
+            "sigma":           _FORECAST_SIGMA_F,
+        }
 
     # Per-city calibrated params (defaults when < 14 days of residuals)
     cparams    = (city_params or {}).get(city or "", {})
     sigma_city = cparams.get("sigma", _FORECAST_SIGMA_F)
     phi_city   = cparams.get("phi",   _AR1_PHI)
 
-    # Independent weather estimate from Open-Meteo using per-city σ and φ.
-    # tau_hrs is passed so estimate_p_yes can apply horizon-conditioned σ from
-    # data/sigma_by_horizon.json when that file has been written by calibrate_sigma.py.
-    p_adj = await estimate_p_yes(ticker, sigma_f=sigma_city, phi=phi_city, tau_hrs=tau_hrs)
+    # estimate_p_yes now takes ContractSemantics — ABOVE/BELOW direction handled inside
+    p_adj = await estimate_p_yes(semantics, sigma_f=sigma_city, phi=phi_city, tau_hrs=tau_hrs)
 
-    # Staleness: high when no weather estimate available or near expiry
     pi_stale = 0.1 if p_adj is not None else 0.4
 
-    # AR(1) correction: recompute with per-city φ from cached e_prev
     ar1_correction = 0.0
     if city and city in _CITY_MAP:
         lat, lon, _ = _CITY_MAP[city]
@@ -231,9 +257,6 @@ async def _build_posterior(
         e_prev = meta.get("e_prev", 0.0) if meta else 0.0
         ar1_correction = phi_city * e_prev
 
-    # Run SMC particle filter to get horizon-scaled temperature uncertainty.
-    # Uses OU propagation: short-horizon markets → tight var, long-horizon → wide var.
-    # sigma_city / 2 maps forecast σ (4°F) to a sensible particle init spread (2°F default).
     posterior_var_T, pf_ess = _run_pf_variance(
         ticker=ticker,
         ar1_correction=ar1_correction,
@@ -243,6 +266,7 @@ async def _build_posterior(
 
     return {
         "P_adj_YES":       p_adj,
+        "semantics":       semantics,
         "posterior_var_T": posterior_var_T,
         "pf_ess":          pf_ess,
         "tau_hrs":         tau_hrs,
@@ -282,9 +306,14 @@ async def trade_cycle(env_mode: str):
     gating       = TradeGating()
 
     # Adaptive city risk guard: evaluates rolling Brier per city, sets blocks/throttles.
-    # refresh() queries DB once per cycle; check() is fast (dict lookup).
     city_guard = CityRiskGuard()
     city_guard.refresh(db, list(_CITY_MAP.keys()), env_mode)
+
+    # Segment guard: city+side+market_type blocking + trust-score shrinkage.
+    # Hard blocks: DEN/YES, TDC/YES, PHIL/YES, LAX/NO (seeded from Jun-13 post-mortem).
+    # Dynamic: DB segment_performance rows drive trust in range [0.0, 0.5].
+    segment_guard = SegmentGuard()
+    segment_guard.refresh(db)
 
     current_balance = Config.BANKROLL
 
@@ -382,6 +411,18 @@ async def trade_cycle(env_mode: str):
             diag.n_tau_skip += 1
             continue
 
+        # Fail-closed: direction must be verified from Kalshi metadata.
+        # semantics was built in _build_posterior from the live market dict.
+        # estimate_p_yes already handled BELOW direction — no post-hoc correction.
+        _semantics = posterior.get("semantics")
+        if _semantics is not None and not _semantics.verified:
+            logger.warning(
+                "BLOCKED_UNVERIFIED_CONTRACT_SEMANTICS: %s — %s",
+                ticker, (_semantics.failure_reason or "unknown"),
+            )
+            diag.n_no_p_yes += 1
+            continue
+
         p_yes = posterior.get("P_adj_YES")
         if p_yes is None:
             diag.n_no_p_yes += 1
@@ -407,9 +448,48 @@ async def trade_cycle(env_mode: str):
             logger.info("CITY_BLOCKED_GUARD: %s (%s) — skipping", ticker, city_code)
             continue
 
-        tgt_date  = _ticker_date(ticker) or ""
+        # Contract semantics audit: DB persistence for audit trail.
+        # Direction decision is already resolved via semantics — audit_and_store is for DB only.
+        _market_type = (_semantics.market_type or "") if _semantics else ""
+        audit_and_store(ticker, db)
+
+        # Segment guard: city+side pre-check before EV is computed.
+        # Determines both allow/block AND trust score for edge shrinkage.
+        # preferred_side computed from raw p_yes vs market to determine which
+        # side we would trade — used for segment check (we only need to check
+        # the side we intend to take, not both).
         market_implied_yes = yes_ask / 100.0
         market_implied_no  = 1.0 - no_ask / 100.0
+        _pref_yes = (p_yes - market_implied_yes) >= (market_implied_no - p_yes)
+        _intended_side = "yes" if _pref_yes else "no"
+
+        _seg_allow, _seg_trust, _seg_status = segment_guard.check(
+            city_code, _intended_side, _market_type
+        )
+        if not _seg_allow:
+            # BLOCKED_SEGMENT_GUARD already logged inside segment_guard.check()
+            continue
+
+        # Market-shrunk edge: replace raw model probability with a convex
+        # combination of market price and model estimate, weighted by trust.
+        #   p_final = p_market + trust * (p_model - p_market)
+        # At trust=0.0: follow market exactly (zero model alpha).
+        # At trust=0.5: model gets half the weight (ceiling until proven).
+        if _seg_trust < 1.0:
+            p_yes_shrunk = market_implied_yes + _seg_trust * (p_yes - market_implied_yes)
+            if _seg_status in ("SHADOW_ONLY", "THROTTLE"):
+                logger.debug(
+                    "EDGE_SHRINK %s: p_model=%.3f p_market=%.3f trust=%.2f "
+                    "→ p_final=%.3f [%s]",
+                    ticker, p_yes, market_implied_yes, _seg_trust,
+                    p_yes_shrunk, _seg_status,
+                )
+            # Patch posterior so DecisionEngine and all downstream calcs use shrunk p
+            posterior = dict(posterior)
+            posterior["P_adj_YES"] = p_yes_shrunk
+            p_yes = p_yes_shrunk
+
+        tgt_date  = _ticker_date(ticker) or ""
         edge_yes  = (p_yes - market_implied_yes) * 100
         edge_no   = (market_implied_no - p_yes) * 100
         best_edge = max(edge_yes, edge_no)
@@ -431,6 +511,8 @@ async def trade_cycle(env_mode: str):
             trade_side=None,   # filled in if/when the order submits
             gumbel_mode=Config.GUMBEL_MODE,
             env_mode=env_mode,
+            direction=(_semantics.direction if _semantics else None),
+            contract_type=(_semantics.contract_type if _semantics else None),
         )
 
         q_inv    = _slot_net_qty(db, city_code, tgt_date, env_mode) if city_code and tgt_date else 0
@@ -714,6 +796,7 @@ async def trade_cycle(env_mode: str):
             no_ask  = market.get("no_ask", 50)
             scan_mid = (yes_ask + (100 - no_ask)) // 2
             fees_c = float(_kalshi_fee_per_contract(fill_price) * intent.target_qty)
+            _fill_sem = posterior.get("semantics")
             trade_logger.log_execution_fill(
                 order_id=order_db_id,
                 exchange_trade_id=ex_order_id,
@@ -729,6 +812,8 @@ async def trade_cycle(env_mode: str):
                 horizon_bin=_tau_to_bin(posterior.get("tau_hrs", 0.0)),
                 expected_value_cents=intent.expected_value * 100.0,
                 fees_cents=fees_c,
+                direction=(_fill_sem.direction if _fill_sem else None),
+                contract_type=(_fill_sem.contract_type if _fill_sem else None),
             )
             logger.info(f"FILLED: {ticker} @ {fill_price}c x {intent.target_qty}")
             trades_taken += 1
@@ -799,11 +884,19 @@ async def trade_cycle(env_mode: str):
             _qty   = int(float(_f["count_fp"]))
             _price = int(round(float(_f["yes_price_dollars"]) * 100)) if _side == "yes" else int(round(float(_f["no_price_dollars"]) * 100))
             _ts    = _f["created_time"].replace("Z", "")
-            if db.log_execution(order_id=_oid, exchange_trade_id=_fid, ticker=_ticker, side=_side, price=_price, qty=_qty, environment=_env, timestamp=_ts):
+            _exec_id = db.log_execution(order_id=_oid, exchange_trade_id=_fid, ticker=_ticker, side=_side, price=_price, qty=_qty, environment=_env, timestamp=_ts)
+            if _exec_id:
                 with db.get_connection() as _conn:
                     _c = _conn.cursor()
                     _c.execute("UPDATE orders SET status='executed', updated_at=GETDATE() WHERE order_id=?", (_oid,))
                     _conn.commit()
+                db.log_trade_attribution(
+                    ticker=_ticker,
+                    execution_id=_exec_id,
+                    city=_ticker_city(_ticker),
+                    side=_side,
+                    fill_price_cents=_price,
+                )
                 _reconciled += 1
         if _reconciled:
             logger.info("FILL_RECONCILE: captured %d missed fill(s) from Kalshi portfolio", _reconciled)

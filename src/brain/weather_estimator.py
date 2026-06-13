@@ -5,7 +5,7 @@ Fetches Open-Meteo forecasts, maps them to Kalshi settlement conditions,
 and returns P(YES settles) as an independent prior for the brain.
 
 Supported ticker formats:
-  KXHIGH{CITY}-{YYMMMDD}-B{LOWER}.5   daily high band [lower, lower+1)
+  KXHIGH{CITY}-{YYMMMDD}-B{MID}.5     daily high band [floor(mid), ceil(mid))
   KXHIGH{CITY}-{YYMMMDD}-T{THRESH}    daily high above/below threshold
   KXTEMP{CITY}-{YYMMMDD}{HH}-T{THRESH} hourly temp above threshold
 """
@@ -17,6 +17,8 @@ import asyncio
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from src.types import ContractSemantics
 
 import aiohttp
 from scipy.stats import t as _student_t
@@ -217,9 +219,13 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
     )
     if m:
         city = normalize_city_code(m.group(1).upper(), market_prefix="KXHIGH")
-        date_str, lower = m.group(2).upper(), float(m.group(3))
+        date_str = m.group(2).upper()
+        # Ticker uses the midpoint of a 1-degree band (e.g. B87.5 → [87, 88))
+        mid = float(m.group(3))
+        lower = float(math.floor(mid))
+        upper = float(math.ceil(mid))
         return {"type": "HIGH_BAND", "city": city, "date_str": date_str,
-                "lower": lower, "upper": lower + 1.0, "hour": None}
+                "lower": lower, "upper": upper, "hour": None}
 
     # KXHIGH{CITY}-{YYMMMDD}-T{THRESH}  (above/below)
     m = re.match(
@@ -443,31 +449,29 @@ def get_forecast_temp_for_ticker(ticker: str) -> Optional[float]:
 
 
 async def estimate_p_yes(
-    ticker: str,
+    semantics: ContractSemantics,
     sigma_f: Optional[float] = None,
     phi: Optional[float] = None,
     tau_hrs: Optional[float] = None,
 ) -> Optional[float]:
     """
     Returns P(YES settles) for a Kalshi weather market based on Open-Meteo forecast.
-    Returns None if the ticker format is unrecognised or the city is unmapped.
+    Takes verified ContractSemantics — direction, bounds, and city are resolved.
 
-    sigma_f:  forecast uncertainty (°F). Uses per-city MLE when provided, else _FORECAST_SIGMA_F.
-    phi:      AR(1) coefficient. Uses per-city OLS when provided, else _AR1_PHI.
-    tau_hrs:  hours to settlement; used to look up horizon-conditioned σ from
-              data/sigma_by_horizon.json. When the file exists, its σ overrides sigma_f
-              for the matching horizon bin, falling back to sigma_f when the bin is absent.
+    BAND:      P(floor_strike <= T < cap_strike)
+    ABOVE:     P(T > threshold)
+    BELOW:     1 - P(T > threshold)
+
+    sigma_f:  forecast uncertainty (°F). Uses per-city MLE when provided, else module default.
+    phi:      AR(1) coefficient. Uses per-city OLS when provided, else module default.
+    tau_hrs:  hours to settlement; selects horizon-conditioned σ from sigma_by_horizon.json.
     """
-    parsed = _parse_ticker(ticker)
-    if not parsed:
-        return None
-
-    city = parsed["city"]
-    if city not in _CITY_MAP:
+    city = semantics.canonical_city
+    if not city or city not in _CITY_MAP:
         return None
 
     lat, lon, tz = _CITY_MAP[city]
-    iso_date = _parse_date(parsed["date_str"])
+    iso_date = semantics.settlement_date
     if not iso_date:
         return None
 
@@ -477,11 +481,9 @@ async def estimate_p_yes(
         sigma_use = _horizon_sigma.get(tau_bin, sigma_f if sigma_f is not None else _FORECAST_SIGMA_F)
     else:
         sigma_use = sigma_f if sigma_f is not None else _FORECAST_SIGMA_F
-    phi_use   = phi     if phi     is not None else _AR1_PHI
+    phi_use = phi if phi is not None else _AR1_PHI
 
-    mtype = parsed["type"]
-
-    # AR(1) bias correction — fetch once per city per run (cached), then apply per-city φ
+    # AR(1) bias correction — fetch once per city per run (cached)
     await _fetch_ar1_correction(lat, lon, tz)
     cache_key = f"ar1:{lat:.3f},{lon:.3f}"
     meta = _ar1_error_cache.get(cache_key)
@@ -489,10 +491,10 @@ async def estimate_p_yes(
     city_code = _LAT_LON_TO_CITY.get(f"{lat:.3f},{lon:.3f}")
     ar1 = _adaptive_bias.correction(city_code) if city_code else phi_use * e_prev
 
-    if mtype in ("HIGH_BAND", "HIGH_ABOVE"):
-        # KXHIGH settles on the daily maximum temperature, not a point-in-time reading.
-        # Apply the same Gumbel σ correction used by the particle filter so that the
-        # probability estimate and the gating variance are consistent.
+    contract_type = semantics.contract_type  # BAND | THRESHOLD | HOURLY
+
+    # Gumbel σ correction for daily-max markets (KXHIGH settles on daily max, not point-in-time)
+    if contract_type in ("BAND", "THRESHOLD"):
         from src.config.env import Config as _Cfg
         _gumbel_mode = getattr(_Cfg, "GUMBEL_MODE", "half")
         _sigma_intraday = 2.0
@@ -503,29 +505,33 @@ async def estimate_p_yes(
             sigma_use = math.sqrt(sigma_use ** 2 + _gumbel_std ** 2)
         logger.debug("T_max sigma: %.3f°F (gumbel_mode=%s)", sigma_use, _gumbel_mode)
 
-    if mtype == "HIGH_BAND":
+    if contract_type == "BAND":
         temp = await _fetch_daily_max(lat, lon, tz, iso_date)
         if temp is None:
             return None
         temp_adj = temp + ar1
-        p_above_lower = _p_above(temp_adj, parsed["lower"], sigma_use)
-        p_above_upper = _p_above(temp_adj, parsed["upper"], sigma_use)
+        p_above_lower = _p_above(temp_adj, semantics.floor_strike, sigma_use)
+        p_above_upper = _p_above(temp_adj, semantics.cap_strike, sigma_use)
         p_band = p_above_lower - p_above_upper
         clamped = max(0.03, min(0.97, p_band))
         if clamped != p_band:
-            logger.debug("PROB_CLAMP_BAND %s: raw=%.5f → %.3f", ticker, p_band, clamped)
+            logger.debug("PROB_CLAMP_BAND %s: raw=%.5f -> %.3f", semantics.ticker, p_band, clamped)
         return float(clamped)
 
-    elif mtype == "HIGH_ABOVE":
+    elif contract_type == "THRESHOLD":
         temp = await _fetch_daily_max(lat, lon, tz, iso_date)
         if temp is None:
             return None
-        return _p_above(temp + ar1, parsed["threshold"], sigma_use)
+        temp_adj = temp + ar1
+        p_above = _p_above(temp_adj, semantics.threshold, sigma_use)
+        if semantics.direction == "BELOW":
+            return 1.0 - p_above
+        return p_above  # direction == "ABOVE"
 
-    elif mtype == "HOURLY_ABOVE":
-        temp = await _fetch_hourly_temp(lat, lon, tz, iso_date, parsed["hour"])
+    elif contract_type == "HOURLY":
+        temp = await _fetch_hourly_temp(lat, lon, tz, iso_date, semantics.settlement_hour)
         if temp is None:
             return None
-        return _p_above(temp + ar1, parsed["threshold"], sigma_use)
+        return _p_above(temp + ar1, semantics.threshold, sigma_use)
 
     return None

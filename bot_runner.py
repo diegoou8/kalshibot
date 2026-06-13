@@ -32,6 +32,8 @@ import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from check_outcomes import run_check as _run_outcome_check
 
+from src.risk.contract_audit import fetch_and_audit_metadata as _fetch_and_audit_meta
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -148,9 +150,10 @@ async def run() -> None:
 
     last_trade        = 0.0
     last_monitor      = 0.0
-    last_prune_date:   Optional[_date] = None
-    last_outcome_date: Optional[_date] = None
-    last_gumbel_date:  Optional[str]   = None
+    last_prune_date:    Optional[_date] = None
+    last_outcome_date:  Optional[_date] = None
+    last_gumbel_date:   Optional[str]   = None
+    last_meta_audit_date: Optional[_date] = None
 
     while True:
         # ── Halt check ────────────────────────────────────────────────────────
@@ -228,6 +231,30 @@ async def run() -> None:
                 )
             except Exception as exc:
                 logger.error("Outcome check failed: %s", exc, exc_info=True)
+
+        # ── Nightly metadata audit (once per day at PRUNE_HOUR_UTC) ─────────────
+        # Fetches Kalshi REST for every ticker seen in orders table and stores
+        # direction_meta / parser_matches_metadata in contract_semantics.
+        # Ensures new BELOW markets (YES if temp < N) get direction_meta=BELOW
+        # so index.py can invert p_yes before next trade cycle.
+        if now_utc.hour == PRUNE_HOUR_UTC and now_utc.date() != last_meta_audit_date:
+            try:
+                with _db.get_connection() as _conn:
+                    _cur = _conn.cursor()
+                    _cur.execute("SELECT DISTINCT ticker FROM orders")
+                    _tickers = [row[0] for row in _cur.fetchall()]
+                sem = asyncio.Semaphore(6)
+                async def _audit_one(t: str) -> None:
+                    async with sem:
+                        try:
+                            await _fetch_and_audit_meta(t, client, _db)
+                        except Exception as _e:
+                            logger.debug("meta_audit[%s] failed: %s", t, _e)
+                await asyncio.gather(*[_audit_one(t) for t in _tickers])
+                last_meta_audit_date = now_utc.date()
+                logger.info("Nightly metadata audit complete for %d tickers.", len(_tickers))
+            except Exception as exc:
+                logger.error("Nightly metadata audit failed: %s", exc, exc_info=True)
 
         # ── Nightly DB prune (once per day at PRUNE_HOUR_UTC) ─────────────────
         if now_utc.hour == PRUNE_HOUR_UTC and now_utc.date() != last_prune_date:

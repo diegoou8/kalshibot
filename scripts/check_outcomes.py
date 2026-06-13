@@ -158,6 +158,10 @@ async def run_check(
                 # 2. Write realized PnL into positions table
                 db.settle_position_with_outcome(ticker, yes_won=(result == "yes"))
 
+                # 3. Write realized PnL into trade_attribution (source of truth for reports)
+                if not (pnl != pnl):   # skip NaN
+                    db.update_attribution_pnl(ticker, pnl)
+
         print(f"{ticker:<34} {fill['side']:<5} {price:<6} {qty:<4} {result:<10} {pnl_str:>8}")
 
     print(f"{'-'*70}")

@@ -451,6 +451,86 @@ class DWTraderDB:
                 # Migration: lvr_cents on executions
                 self._add_column_if_not_exists(c, "executions", "lvr_cents", "FLOAT")
 
+                # 17. SEGMENT PERFORMANCE — per (city, side, market_type, horizon, strike, mode)
+                self._create_table_if_not_exists(c, "segment_performance", """
+                    CREATE TABLE segment_performance (
+                        segment_id              INT IDENTITY(1,1) PRIMARY KEY,
+                        city                    NVARCHAR(20) NOT NULL,
+                        side                    NVARCHAR(5)  NOT NULL,
+                        market_type             NVARCHAR(20),
+                        horizon_bucket          NVARCHAR(20),
+                        strike_distance_bucket  NVARCHAR(20),
+                        gumbel_mode             NVARCHAR(20),
+                        n_fills                 INT DEFAULT 0,
+                        n_settled               INT DEFAULT 0,
+                        avg_ev_cents            FLOAT,
+                        realized_pnl_cents      FLOAT,
+                        brier                   FLOAT,
+                        hit_rate                FLOAT,
+                        roi                     FLOAT,
+                        status                  NVARCHAR(20) DEFAULT 'SHADOW_ONLY',
+                        updated_at              DATETIME2 NOT NULL
+                    )
+                """)
+                c.execute(
+                    "IF NOT EXISTS (SELECT 1 FROM sys.indexes "
+                    "WHERE name='uq_segment_perf') "
+                    "CREATE UNIQUE INDEX uq_segment_perf "
+                    "ON segment_performance (city, side, market_type, "
+                    "horizon_bucket, strike_distance_bucket, gumbel_mode)"
+                )
+
+                # 18. CONTRACT SEMANTICS AUDIT — parsed ticker fields + settlement rules
+                self._create_table_if_not_exists(c, "contract_semantics", """
+                    CREATE TABLE contract_semantics (
+                        semantics_id    INT IDENTITY(1,1) PRIMARY KEY,
+                        ticker          NVARCHAR(100) NOT NULL,
+                        market_type     NVARCHAR(20),
+                        city            NVARCHAR(20),
+                        settle_date     NVARCHAR(20),
+                        hour_local      INT,
+                        threshold_f     FLOAT,
+                        direction       NVARCHAR(10),
+                        bucket_lower_f  FLOAT,
+                        bucket_upper_f  FLOAT,
+                        timezone_city   NVARCHAR(50),
+                        temp_source     NVARCHAR(200),
+                        settlement_rule NVARCHAR(500),
+                        audit_warnings  NVARCHAR(MAX),
+                        recorded_at     DATETIME2 NOT NULL
+                    )
+                """)
+                c.execute(
+                    "IF NOT EXISTS (SELECT 1 FROM sys.indexes "
+                    "WHERE name='uq_contract_semantics_ticker') "
+                    "CREATE UNIQUE INDEX uq_contract_semantics_ticker "
+                    "ON contract_semantics (ticker)"
+                )
+
+                # contract_semantics metadata columns (added 2026-06-13)
+                for col, defn in [
+                    ("kx_title",                "NVARCHAR(500)"),
+                    ("kx_rules_primary",         "NVARCHAR(MAX)"),
+                    ("kx_strike_type",           "NVARCHAR(30)"),
+                    ("kx_floor_strike",          "FLOAT"),
+                    ("kx_cap_strike",            "FLOAT"),
+                    ("kx_occurrence_datetime",   "NVARCHAR(50)"),
+                    ("parser_matches_metadata",  "BIT"),
+                    ("unsupported",              "BIT DEFAULT 0"),
+                    ("mismatch_details",         "NVARCHAR(MAX)"),
+                    ("direction_meta",           "NVARCHAR(10)"),
+                    ("metadata_fetched_at",      "DATETIME2"),
+                ]:
+                    self._add_column_if_not_exists(c, "contract_semantics", col, defn)
+
+                # calibration_diagnostics + trade_attribution: direction + contract_type columns
+                for col, defn in [
+                    ("direction",     "NVARCHAR(10)"),
+                    ("contract_type", "NVARCHAR(20)"),
+                ]:
+                    self._add_column_if_not_exists(c, "calibration_diagnostics", col, defn)
+                    self._add_column_if_not_exists(c, "trade_attribution", col, defn)
+
                 # 16. BOT CONFIG — runtime key/value overrides (e.g. GUMBEL_MODE)
                 # Note: 'key' is reserved in SQL Server — column is named config_key.
                 self._create_table_if_not_exists(c, "bot_config", """
@@ -1298,6 +1378,8 @@ class DWTraderDB:
         slippage_cents: Optional[float] = None,
         fees_cents: Optional[float] = None,
         holding_time_hrs: Optional[float] = None,
+        direction: Optional[str] = None,
+        contract_type: Optional[str] = None,
     ) -> Optional[int]:
         """
         Record a per-fill PnL attribution row decomposing the trade result into:
@@ -1316,8 +1398,9 @@ class DWTraderDB:
                         predicted_p, market_implied_p, realized_outcome,
                         expected_value_cents, realized_pnl_cents,
                         slippage_cents, fees_cents, holding_time_hrs,
+                        direction, contract_type,
                         recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         execution_id, ticker, city, side, horizon_bin,
@@ -1325,6 +1408,7 @@ class DWTraderDB:
                         predicted_p, market_implied_p, realized_outcome,
                         expected_value_cents, realized_pnl_cents,
                         slippage_cents, fees_cents, holding_time_hrs,
+                        direction, contract_type,
                         ts,
                     ),
                 )
@@ -1348,6 +1432,8 @@ class DWTraderDB:
         trade_side: Optional[str],
         gumbel_mode: Optional[str],
         env_mode: Optional[str],
+        direction: Optional[str] = None,
+        contract_type: Optional[str] = None,
     ) -> Optional[int]:
         """Insert one calibration diagnostic row. Returns lastrowid or None on error."""
         try:
@@ -1357,12 +1443,14 @@ class DWTraderDB:
                     """
                     INSERT INTO calibration_diagnostics (
                         ts, ticker, city, horizon_bucket, strike_distance_bucket,
-                        p_model, p_market, edge, trade_side, gumbel_mode, env_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        p_model, p_market, edge, trade_side, gumbel_mode, env_mode,
+                        direction, contract_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ts, ticker, city, horizon_bucket, strike_distance_bucket,
                         p_model, p_market, edge, trade_side, gumbel_mode, env_mode,
+                        direction, contract_type,
                     ),
                 )
                 row_id = self._last_id(c)
@@ -1503,3 +1591,219 @@ class DWTraderDB:
                 logger.info("bot_config: %s = %s", key, value)
         except Exception as e:
             logger.error("set_config(%s, %s) failed: %s", key, value, e)
+
+    # ------------------------------------------------------------------
+    # SEGMENT PERFORMANCE — per (city, side, market_type, …) trust store
+    # ------------------------------------------------------------------
+
+    def upsert_segment_performance(
+        self,
+        city: str,
+        side: str,
+        market_type: str,
+        horizon_bucket: str,
+        strike_distance_bucket: str,
+        gumbel_mode: str,
+        n_fills: int,
+        n_settled: int,
+        avg_ev_cents: Optional[float],
+        realized_pnl_cents: Optional[float],
+        brier: Optional[float],
+        hit_rate: Optional[float],
+        roi: Optional[float],
+        status: str,
+    ) -> None:
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                now = datetime.now().isoformat()
+                c.execute(
+                    """
+                    MERGE segment_performance AS tgt
+                    USING (VALUES (?, ?, ?, ?, ?, ?)) AS src
+                        (city, side, market_type, horizon_bucket,
+                         strike_distance_bucket, gumbel_mode)
+                        ON tgt.city = src.city
+                       AND tgt.side = src.side
+                       AND tgt.market_type = src.market_type
+                       AND tgt.horizon_bucket = src.horizon_bucket
+                       AND tgt.strike_distance_bucket = src.strike_distance_bucket
+                       AND tgt.gumbel_mode = src.gumbel_mode
+                    WHEN MATCHED THEN UPDATE SET
+                        n_fills=?, n_settled=?, avg_ev_cents=?,
+                        realized_pnl_cents=?, brier=?, hit_rate=?, roi=?,
+                        status=?, updated_at=?
+                    WHEN NOT MATCHED THEN INSERT
+                        (city, side, market_type, horizon_bucket,
+                         strike_distance_bucket, gumbel_mode,
+                         n_fills, n_settled, avg_ev_cents,
+                         realized_pnl_cents, brier, hit_rate, roi,
+                         status, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        city, side, market_type, horizon_bucket,
+                        strike_distance_bucket, gumbel_mode,
+                        n_fills, n_settled, avg_ev_cents,
+                        realized_pnl_cents, brier, hit_rate, roi, status, now,
+                        city, side, market_type, horizon_bucket,
+                        strike_distance_bucket, gumbel_mode,
+                        n_fills, n_settled, avg_ev_cents,
+                        realized_pnl_cents, brier, hit_rate, roi, status, now,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(
+                "upsert_segment_performance(%s/%s/%s) failed: %s",
+                city, side, market_type, e,
+            )
+
+    def get_segment_rows(self) -> list:
+        """Return all segment_performance rows as dicts."""
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT * FROM segment_performance")
+                cols = [d[0] for d in c.description]
+                return [dict(zip(cols, r)) for r in c.fetchall()]
+        except Exception as e:
+            logger.error("get_segment_rows failed: %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    # CONTRACT SEMANTICS AUDIT
+    # ------------------------------------------------------------------
+
+    def upsert_contract_semantics(
+        self,
+        ticker: str,
+        market_type: Optional[str],
+        city: Optional[str],
+        settle_date: Optional[str],
+        hour_local: Optional[int],
+        threshold_f: Optional[float],
+        direction: Optional[str],
+        bucket_lower_f: Optional[float],
+        bucket_upper_f: Optional[float],
+        timezone_city: Optional[str],
+        temp_source: Optional[str],
+        settlement_rule: Optional[str],
+        audit_warnings: Optional[str],
+        # Kalshi metadata fields (optional — set by batch_market_audit)
+        kx_title: Optional[str] = None,
+        kx_rules_primary: Optional[str] = None,
+        kx_strike_type: Optional[str] = None,
+        kx_floor_strike: Optional[float] = None,
+        kx_cap_strike: Optional[float] = None,
+        kx_occurrence_datetime: Optional[str] = None,
+        parser_matches_metadata: Optional[bool] = None,
+        unsupported: bool = False,
+        mismatch_details: Optional[str] = None,
+        direction_meta: Optional[str] = None,
+        metadata_fetched_at: Optional[str] = None,
+    ) -> None:
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                now = datetime.now().isoformat()
+                pmm = (1 if parser_matches_metadata else 0) if parser_matches_metadata is not None else None
+                uns = 1 if unsupported else 0
+                mfa = metadata_fetched_at or (now if kx_title is not None else None)
+                c.execute(
+                    """
+                    MERGE contract_semantics AS tgt
+                    USING (VALUES (?)) AS src(ticker) ON tgt.ticker = src.ticker
+                    WHEN MATCHED THEN UPDATE SET
+                        market_type=?, city=?, settle_date=?, hour_local=?,
+                        threshold_f=?, direction=?, bucket_lower_f=?,
+                        bucket_upper_f=?, timezone_city=?, temp_source=?,
+                        settlement_rule=?, audit_warnings=?,
+                        kx_title=?, kx_rules_primary=?, kx_strike_type=?,
+                        kx_floor_strike=?, kx_cap_strike=?,
+                        kx_occurrence_datetime=?, parser_matches_metadata=?,
+                        unsupported=?, mismatch_details=?, direction_meta=?,
+                        metadata_fetched_at=?, recorded_at=?
+                    WHEN NOT MATCHED THEN INSERT
+                        (ticker, market_type, city, settle_date, hour_local,
+                         threshold_f, direction, bucket_lower_f, bucket_upper_f,
+                         timezone_city, temp_source, settlement_rule, audit_warnings,
+                         kx_title, kx_rules_primary, kx_strike_type,
+                         kx_floor_strike, kx_cap_strike, kx_occurrence_datetime,
+                         parser_matches_metadata, unsupported, mismatch_details,
+                         direction_meta, metadata_fetched_at, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        ticker,
+                        # UPDATE branch
+                        market_type, city, settle_date, hour_local,
+                        threshold_f, direction, bucket_lower_f, bucket_upper_f,
+                        timezone_city, temp_source, settlement_rule, audit_warnings,
+                        kx_title, kx_rules_primary, kx_strike_type,
+                        kx_floor_strike, kx_cap_strike, kx_occurrence_datetime,
+                        pmm, uns, mismatch_details, direction_meta, mfa, now,
+                        # INSERT branch
+                        ticker, market_type, city, settle_date, hour_local,
+                        threshold_f, direction, bucket_lower_f, bucket_upper_f,
+                        timezone_city, temp_source, settlement_rule, audit_warnings,
+                        kx_title, kx_rules_primary, kx_strike_type,
+                        kx_floor_strike, kx_cap_strike, kx_occurrence_datetime,
+                        pmm, uns, mismatch_details, direction_meta, mfa, now,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error("upsert_contract_semantics(%s) failed: %s", ticker, e)
+
+    def get_contract_semantics(self, ticker: str) -> Optional[Dict]:
+        """Return the stored audit row for ticker, or None if not yet audited."""
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT * FROM contract_semantics WHERE ticker = ?", (ticker,)
+                )
+                row = c.fetchone()
+                if row is None:
+                    return None
+                return self._row_to_dict(c, row)
+        except Exception as e:
+            logger.error("get_contract_semantics(%s) failed: %s", ticker, e)
+            return None
+
+    # ------------------------------------------------------------------
+    # TRADE ATTRIBUTION — realized PnL writeback
+    # ------------------------------------------------------------------
+
+    def update_attribution_pnl(self, ticker: str, realized_pnl_cents: float) -> int:
+        """
+        Set realized_pnl_cents and realized_outcome on all trade_attribution rows
+        for ticker where the field is still NULL.
+        Returns number of rows updated.
+        """
+        try:
+            with self.get_connection() as conn:
+                c = conn.cursor()
+                # realized_outcome: 1 if the position won (YES settled = YES fill or NO settled = NO fill)
+                # We infer outcome from sign of pnl relative to fill price per row
+                c.execute(
+                    """
+                    UPDATE trade_attribution
+                    SET realized_pnl_cents = ?,
+                        realized_outcome = CASE
+                            WHEN ? >= 0 THEN 1
+                            ELSE 0
+                        END
+                    WHERE ticker = ?
+                      AND realized_pnl_cents IS NULL
+                    """,
+                    (realized_pnl_cents, realized_pnl_cents, ticker),
+                )
+                n = c.rowcount
+                conn.commit()
+                return n
+        except Exception as e:
+            logger.error("update_attribution_pnl(%s) failed: %s", ticker, e)
+            return 0

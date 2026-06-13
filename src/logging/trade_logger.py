@@ -120,6 +120,8 @@ class TradeLogger:
         horizon_bin: Optional[str] = None,
         expected_value_cents: Optional[float] = None,
         fees_cents: Optional[float] = None,
+        direction: Optional[str] = None,
+        contract_type: Optional[str] = None,
     ) -> Optional[int]:
         """
         Log a buy fill: write execution row, then write trade_attribution row.
@@ -154,6 +156,8 @@ class TradeLogger:
                 expected_value_cents=expected_value_cents,
                 slippage_cents=slippage,
                 fees_cents=fees_cents,
+                direction=direction,
+                contract_type=contract_type,
             )
             # After trade_attribution insert
             if execution_id is not None and attribution_id is None:
