@@ -189,12 +189,15 @@ def _normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
 async def _build_posterior(
     m: Dict[str, Any],
     city_params: Optional[Dict[str, Dict]] = None,
+    db: Optional["DWTraderDB"] = None,
 ) -> Dict[str, Any]:
     """
     Build a posterior dict for the brain.
 
     Calls get_verified_contract_semantics(ticker, m) to resolve direction
     from the live Kalshi market dict (which contains strike_type).
+    Falls back to the DB-cached kx_strike_type when the bulk markets endpoint
+    does not include strike_type (T-type markets always need it).
     Returns semantics in the posterior so Phase 1d can enforce fail-closed.
 
     city_params: per-city calibrated {sigma, phi} from load_city_params().
@@ -223,6 +226,31 @@ async def _build_posterior(
     except Exception as _sem_exc:
         logger.warning("ContractSemantics build failed for %s: %s", ticker, _sem_exc)
         semantics = None
+
+    # DB fallback for DIRECTION_UNKNOWN_NO_METADATA: the bulk /markets?series_ticker=...
+    # endpoint does NOT include strike_type in its market objects. The nightly
+    # fetch_and_audit_metadata() calls /markets/{ticker} individually and stores
+    # kx_strike_type in contract_semantics. Use that cached value as fallback so
+    # T-type markets that have been audited at least once remain tradeable.
+    if (
+        db is not None
+        and semantics is not None
+        and not semantics.verified
+        and semantics.failure_reason == "DIRECTION_UNKNOWN_NO_METADATA"
+    ):
+        try:
+            _cs = db.get_contract_semantics(ticker)
+            if _cs and _cs.get("kx_strike_type"):
+                _cached_st = _cs["kx_strike_type"]
+                _rebuilt = get_verified_contract_semantics(ticker, {"strike_type": _cached_st})
+                if _rebuilt.verified:
+                    logger.debug("ContractSemantics DB fallback OK: %s → %s", ticker, _rebuilt.direction)
+                    semantics = _rebuilt
+                else:
+                    logger.debug("ContractSemantics DB fallback still unverified: %s (%s)",
+                                 ticker, _rebuilt.failure_reason)
+        except Exception as _fb_exc:
+            logger.warning("ContractSemantics DB fallback error %s: %s", ticker, _fb_exc)
 
     city = (semantics.canonical_city if semantics else None) or _ticker_city(ticker)
 
@@ -365,7 +393,7 @@ async def trade_cycle(env_mode: str):
     # The module-level _forecast_cache and _ar1_error_cache ensure each unique
     # city+date is only fetched once despite concurrent access.
     posteriors_raw = await asyncio.gather(
-        *[_build_posterior(m, city_params) for m in valid_markets],
+        *[_build_posterior(m, city_params, db=db) for m in valid_markets],
         return_exceptions=True,
     )
 
