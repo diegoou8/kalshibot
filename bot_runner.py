@@ -31,6 +31,7 @@ from src.config.experiment import GUMBEL_SCHEDULE
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from check_outcomes import run_check as _run_outcome_check
+from backfill_segment_performance import run_update as _run_segment_update
 
 from src.risk.contract_audit import fetch_and_audit_metadata as _fetch_and_audit_meta
 
@@ -150,10 +151,11 @@ async def run() -> None:
 
     last_trade        = 0.0
     last_monitor      = 0.0
-    last_prune_date:    Optional[_date] = None
-    last_outcome_date:  Optional[_date] = None
-    last_gumbel_date:   Optional[str]   = None
-    last_meta_audit_date: Optional[_date] = None
+    last_prune_date:         Optional[_date] = None
+    last_outcome_date:       Optional[_date] = None
+    last_gumbel_date:        Optional[str]   = None
+    last_meta_audit_date:    Optional[_date] = None
+    last_segment_update_date: Optional[_date] = None
 
     while True:
         # ── Halt check ────────────────────────────────────────────────────────
@@ -231,6 +233,29 @@ async def run() -> None:
                 )
             except Exception as exc:
                 logger.error("Outcome check failed: %s", exc, exc_info=True)
+
+        # ── Segment performance update (every 2 days at PRUNE_HOUR_UTC) ───────────
+        # Aggregates settled fills (post-2026-06-13 direction fix) into
+        # segment_performance so SegmentGuard trust scores stay current.
+        # Runs every other day — enough cadence for the ~5-min trade cycle to
+        # see fresh trust scores without hammering the DB on every outcome check.
+        _seg_due = (
+            last_segment_update_date is None
+            or (now_utc.date() - last_segment_update_date).days >= 2
+        )
+        if now_utc.hour == PRUNE_HOUR_UTC and _seg_due:
+            try:
+                seg_summary = _run_segment_update(_db, dry_run=False)
+                last_segment_update_date = now_utc.date()
+                logger.info(
+                    "Segment update complete | segments=%d | throttle=%d | allow=%d | block=%d",
+                    seg_summary["segments_written"],
+                    seg_summary["throttle_count"],
+                    seg_summary["allow_count"],
+                    seg_summary["block_count"],
+                )
+            except Exception as exc:
+                logger.error("Segment update failed: %s", exc, exc_info=True)
 
         # ── Nightly metadata audit (once per day at PRUNE_HOUR_UTC) ─────────────
         # Fetches Kalshi REST for every ticker seen in orders table and stores

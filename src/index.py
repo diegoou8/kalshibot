@@ -37,9 +37,11 @@ logger = logging.getLogger("IndexOrchestrator")
 TEST_MAX_QTY = 2
 
 # Probability-edge gate: fair-value P(YES) must differ from market-implied P(YES)
-# by at least this many percentage points (pp × 100) before we evaluate EV.
-# 15 = 15 pp of edge. This is NOT the same unit as EV cents.
-MIN_PROB_EDGE_PP = 15
+# by at least this many percentage points before we evaluate EV.
+# Applied to the RAW model estimate (before any trust shrinkage) so that segments
+# with trust < 1.0 don't get filtered out before the engine can size them down.
+# 8pp = meaningful model disagreement given σ=4°F forecast uncertainty.
+MIN_PROB_EDGE_PP = 8
 
 # Minimum net EV per contract in cents after fees before an order may be submitted.
 # Matches DecisionEngine.min_edge_cents. Belt-and-suspenders final guard uses this.
@@ -498,32 +500,23 @@ async def trade_cycle(env_mode: str):
             # BLOCKED_SEGMENT_GUARD already logged inside segment_guard.check()
             continue
 
-        # Market-shrunk edge: replace raw model probability with a convex
-        # combination of market price and model estimate, weighted by trust.
-        #   p_final = p_market + trust * (p_model - p_market)
-        # At trust=0.0: follow market exactly (zero model alpha).
-        # At trust=0.5: model gets half the weight (ceiling until proven).
-        if _seg_trust < 1.0:
-            p_yes_shrunk = market_implied_yes + _seg_trust * (p_yes - market_implied_yes)
-            if _seg_status in ("SHADOW_ONLY", "THROTTLE"):
-                logger.debug(
-                    "EDGE_SHRINK %s: p_model=%.3f p_market=%.3f trust=%.2f "
-                    "→ p_final=%.3f [%s]",
-                    ticker, p_yes, market_implied_yes, _seg_trust,
-                    p_yes_shrunk, _seg_status,
-                )
-            # Patch posterior so DecisionEngine and all downstream calcs use shrunk p
-            posterior = dict(posterior)
-            posterior["P_adj_YES"] = p_yes_shrunk
-            p_yes = p_yes_shrunk
+        # Raw edge from model BEFORE any trust shrinkage.
+        # Edge filter runs on raw so a low-trust segment isn't silenced before
+        # the engine can size it down via the Kelly shrinkage path below.
+        p_yes_raw = p_yes
+        raw_edge_yes = (p_yes_raw - market_implied_yes) * 100
+        raw_edge_no  = (market_implied_no - p_yes_raw) * 100
+        raw_best_edge = max(raw_edge_yes, raw_edge_no)
 
         tgt_date  = _ticker_date(ticker) or ""
-        edge_yes  = (p_yes - market_implied_yes) * 100
-        edge_no   = (market_implied_no - p_yes) * 100
-        best_edge = max(edge_yes, edge_no)
+        q_inv    = _slot_net_qty(db, city_code, tgt_date, env_mode) if city_code and tgt_date else 0
+        sigma_p  = math.sqrt(max(1.0, posterior.get("posterior_var_T", 1.0))) / 10.0
+        as_adj   = q_inv * 0.10 * sigma_p * posterior.get("tau_hrs", 24.0)
+        min_edge = max(1.0, MIN_PROB_EDGE_PP + as_adj * 100)
 
         # Calibration diagnostic: log every evaluated market (pre-edge-filter)
-        _preferred_side = "yes" if edge_yes >= edge_no else "no"
+        # Logs RAW p_model (not shrunk) so calibration analysis sees true model estimates.
+        _preferred_side = "yes" if raw_edge_yes >= raw_edge_no else "no"
         _strike_z_val = compute_strike_z(ticker, posterior.get("sigma", 4.0))
         _strike_bucket = _strike_distance_bucket(_strike_z_val)
         _h_bucket = _tau_to_bin(posterior.get("tau_hrs", 0.0))
@@ -533,9 +526,9 @@ async def trade_cycle(env_mode: str):
             city=city_code or None,
             horizon_bucket=_h_bucket,
             strike_distance_bucket=_strike_bucket,
-            p_model=float(p_yes),
+            p_model=float(p_yes_raw),
             p_market=float(yes_ask / 100.0),
-            edge=float(best_edge),
+            edge=float(raw_best_edge),
             trade_side=None,   # filled in if/when the order submits
             gumbel_mode=Config.GUMBEL_MODE,
             env_mode=env_mode,
@@ -543,14 +536,31 @@ async def trade_cycle(env_mode: str):
             contract_type=(_semantics.contract_type if _semantics else None),
         )
 
-        q_inv    = _slot_net_qty(db, city_code, tgt_date, env_mode) if city_code and tgt_date else 0
-        sigma_p  = math.sqrt(max(1.0, posterior.get("posterior_var_T", 1.0))) / 10.0
-        as_adj   = q_inv * 0.10 * sigma_p * posterior.get("tau_hrs", 24.0)
-        min_edge = max(1.0, MIN_PROB_EDGE_PP + as_adj * 100)
-
-        if best_edge < min_edge:
+        if raw_best_edge < min_edge:
             diag.n_edge_fail += 1
             continue
+
+        # Trust shrinkage applied AFTER the edge filter: segment trust controls
+        # how much of the model's alpha we keep for EV/Kelly sizing, not whether
+        # the market is worth evaluating at all.
+        #   p_final = p_market + trust * (p_model − p_market)
+        # At trust=1.0 (current default for all segments): no shrinkage.
+        # At trust<1.0 (future: segments with proven poor calibration): shrinks sizing.
+        if _seg_trust < 1.0:
+            p_yes_shrunk = market_implied_yes + _seg_trust * (p_yes - market_implied_yes)
+            logger.debug(
+                "EDGE_SHRINK %s: p_model=%.3f p_market=%.3f trust=%.2f "
+                "→ p_final=%.3f [%s]",
+                ticker, p_yes, market_implied_yes, _seg_trust,
+                p_yes_shrunk, _seg_status,
+            )
+            posterior = dict(posterior)
+            posterior["P_adj_YES"] = p_yes_shrunk
+            p_yes = p_yes_shrunk
+
+        edge_yes  = (p_yes - market_implied_yes) * 100
+        edge_no   = (market_implied_no - p_yes) * 100
+        best_edge = max(edge_yes, edge_no)
 
         if "KXHIGH" in ticker.upper() and logger.isEnabledFor(logging.DEBUG):
             _var_T = posterior.get("posterior_var_T", 4.0)

@@ -32,15 +32,19 @@ _HARD_BLOCKS: Dict[Tuple[str, str], str] = {
 }
 
 # Trust thresholds
-_TRUST_SHADOW_SETTLED   = 10     # n_settled < this → SHADOW_ONLY
+# Post direction-fix (2026-06-07): segment_performance is empty — no evidence of
+# model failure on any city/side.  Hard blocks (DEN/YES etc.) protect the known
+# bad segments.  All other segments default to full trust so the model can trade
+# and accumulate clean performance data.  Once 20+ settled fills exist per
+# segment, _compute_status will auto-promote or block based on measured metrics.
 _TRUST_MIN_SETTLED      = 20     # need this many before BLOCK or ALLOW
 _TRUST_BLOCK_ROI        = -0.10  # roi < this (with n >= min) → BLOCK
 _TRUST_BLOCK_BRIER      = 0.35   # brier > this (with n >= min) → BLOCK
 _TRUST_ALLOW_BRIER      = 0.20   # brier < this + positive pnl → ALLOW
-_TRUST_MAX              = 0.50   # hard ceiling until out-of-sample proof
-_TRUST_ALLOW            = 0.50
-_TRUST_THROTTLE         = 0.25
-_TRUST_SHADOW           = 0.00
+_TRUST_MAX              = 1.00   # full trust until DB shows otherwise
+_TRUST_ALLOW            = 1.00
+_TRUST_THROTTLE         = 1.00   # unseen / young segments trust model fully
+_TRUST_SHADOW           = 0.00   # reserved for explicit SHADOW_ONLY status
 
 
 class SegmentGuard:
@@ -81,9 +85,6 @@ class SegmentGuard:
         brier     = row.get("brier")
         pnl       = row.get("realized_pnl_cents") or 0.0
 
-        if n_settled < _TRUST_SHADOW_SETTLED:
-            return "SHADOW_ONLY", _TRUST_SHADOW
-
         if n_settled >= _TRUST_MIN_SETTLED:
             if roi is not None and roi < _TRUST_BLOCK_ROI:
                 return "BLOCK", 0.0
@@ -92,6 +93,7 @@ class SegmentGuard:
             if pnl > 0 and brier is not None and brier < _TRUST_ALLOW_BRIER:
                 return "ALLOW", _TRUST_ALLOW
 
+        # < 20 settled → THROTTLE at full trust (post direction-fix baseline)
         return "THROTTLE", _TRUST_THROTTLE
 
     def check(
@@ -125,8 +127,9 @@ class SegmentGuard:
             or self._cache.get((city_up, side_low, ""))
         )
         if entry is None:
-            # Unseen segment — shadow only until we accumulate data
-            return True, _TRUST_SHADOW, "SHADOW_ONLY"
+            # Unseen segment — full trust (1.0) since segment_performance is empty
+            # and we have zero evidence of model failure post direction-fix.
+            return True, _TRUST_THROTTLE, "THROTTLE"
 
         status = entry["status"]
         trust  = entry["trust"]
