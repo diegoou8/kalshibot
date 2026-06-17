@@ -161,8 +161,19 @@ class CityRiskGuard:
                     "in last 20 settled predictions",
                     city, tail_count, TAIL_RISK_P_THRESHOLD * 100,
                 )
-                self.block_city(city, "TAIL_RISK")
-                self._throttle[city] = 0.0
+                if _is_live:
+                    # Live mode: hard 24h block protects real capital
+                    self.block_city(city, "TAIL_RISK")
+                    self._throttle[city] = 0.0
+                else:
+                    # Paper mode: throttle to 0.25× instead of blocking so calibration
+                    # data can accumulate (blocking deadlocks the loop — city never settles
+                    # new trades to correct the signal).
+                    self._throttle[city] = PAPER_BRIER_THROTTLE
+                    logger.info(
+                        "TAIL_RISK_THROTTLE_PAPER_MODE: %s — throttled to %.2f× (no block)",
+                        city, PAPER_BRIER_THROTTLE,
+                    )
                 continue
 
             # Brier-based throttle/block — only active when BRIER_BLOCK_ENABLED=true.

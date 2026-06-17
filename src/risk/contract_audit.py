@@ -81,11 +81,13 @@ def audit_ticker(ticker: str) -> Dict:
         prefix = "KXHIGH"
     elif ticker_up.startswith("KXTEMP"):
         prefix = "KXTEMP"
+    elif ticker_up.startswith("KXLOWT"):
+        prefix = "KXLOWT"
     else:
         return {
             "ticker": ticker,
             "valid": False,
-            "warnings": [f"UNKNOWN_PREFIX: ticker does not start with KXHIGH or KXTEMP"],
+            "warnings": [f"UNKNOWN_PREFIX: ticker does not start with KXHIGH, KXTEMP, or KXLOWT"],
         }
 
     # ── Delegate parse to weather_estimator._parse_ticker ────────────────────
@@ -165,6 +167,29 @@ def audit_ticker(ticker: str) -> Dict:
                 f"Settlement source: Open-Meteo daily max; Kalshi settles on NWS observed max."
             )
 
+    elif market_type == "LOW_BAND":
+        # B54.5 → YES if daily_min_F ∈ [54, 55)
+        temp_source = "daily_min_F (Open-Meteo temperature_2m_min, Fahrenheit)"
+        direction = "BAND"
+        if bucket_lower is not None and bucket_upper is not None:
+            settlement_rule = (
+                f"YES if city={city} daily min temperature (°F) is in "
+                f"[{bucket_lower:.1f}, {bucket_upper:.1f}). "
+                f"Date is {settle_date} local {tz}. "
+                f"Settlement source: Open-Meteo daily min; Kalshi settles on NWS observed min."
+            )
+
+    elif market_type == "LOW_ABOVE":
+        # T67 → YES if daily_min_F > 67 (or < 67 for BELOW direction)
+        temp_source = "daily_min_F (Open-Meteo temperature_2m_min, Fahrenheit)"
+        direction = "ABOVE"
+        if threshold_f is not None:
+            settlement_rule = (
+                f"YES if city={city} daily min temperature (°F) >= {threshold_f:.1f}. "
+                f"Date is {settle_date} local {tz}. "
+                f"Settlement source: Open-Meteo daily min; Kalshi settles on NWS observed min."
+            )
+
     elif market_type == "HOURLY_ABOVE":
         # T88 on KXTEMP → YES if temp at hour HH >= 88
         temp_source = "hourly_temp_F (Open-Meteo temperature_2m, Fahrenheit, hourly)"
@@ -184,6 +209,12 @@ def audit_ticker(ticker: str) -> Dict:
             "daily max; model uses Open-Meteo forecast. In summer, NWS airport "
             "stations may read 1-3°F above/below Open-Meteo grid point — check "
             "for city-specific bias in calibration_diagnostics."
+        )
+    elif market_type in ("LOW_BAND", "LOW_ABOVE"):
+        warnings.append(
+            "MODEL_SOURCE_MISMATCH_RISK: Kalshi KXLOWT settles on NWS observed "
+            "daily min; model uses Open-Meteo temperature_2m_min forecast. "
+            "Check for city-specific bias in calibration_diagnostics."
         )
 
     return {
@@ -374,8 +405,12 @@ def get_verified_contract_semantics(
     # Map internal type to canonical contract_type
     if mtype == "HIGH_BAND":
         contract_type = "BAND"
+    elif mtype == "LOW_BAND":
+        contract_type = "LOW_BAND"
     elif mtype == "HOURLY_ABOVE":
         contract_type = "HOURLY"
+    elif mtype == "LOW_ABOVE":
+        contract_type = "LOW_THRESHOLD"
     else:
         contract_type = "THRESHOLD"
 
@@ -448,6 +483,60 @@ def get_verified_contract_semantics(
                 failure_reason="STRUCTURAL_MISMATCH:parser=THRESHOLD,meta=BAND",
             )
         # direction_meta is ABOVE or BELOW — verified
+        return ContractSemantics(
+            ticker=ticker, canonical_city=city, market_type=mtype,
+            contract_type=contract_type, direction=direction_meta,
+            threshold=parsed.get("threshold"), floor_strike=None, cap_strike=None,
+            settlement_date=settlement_date, settlement_hour=None,
+            verified=True, failure_reason=None,
+        )
+
+    elif mtype == "LOW_BAND":
+        # Same logic as HIGH_BAND but uses daily min temperature
+        if direction_meta and direction_meta != "BAND":
+            return ContractSemantics(
+                ticker=ticker, canonical_city=city, market_type=mtype,
+                contract_type=contract_type, direction=None,
+                threshold=None, floor_strike=parsed.get("lower"), cap_strike=parsed.get("upper"),
+                settlement_date=settlement_date, settlement_hour=None,
+                verified=False,
+                failure_reason=f"STRUCTURAL_MISMATCH:parser=LOW_BAND,meta={direction_meta}",
+            )
+        return ContractSemantics(
+            ticker=ticker, canonical_city=city, market_type=mtype,
+            contract_type=contract_type, direction="BAND",
+            threshold=None, floor_strike=parsed.get("lower"), cap_strike=parsed.get("upper"),
+            settlement_date=settlement_date, settlement_hour=None,
+            verified=True, failure_reason=None,
+        )
+
+    elif mtype == "LOW_ABOVE":
+        # Same logic as HIGH_ABOVE — direction MUST come from metadata strike_type
+        if not strike_type_raw:
+            return ContractSemantics(
+                ticker=ticker, canonical_city=city, market_type=mtype,
+                contract_type=contract_type, direction=None,
+                threshold=parsed.get("threshold"), floor_strike=None, cap_strike=None,
+                settlement_date=settlement_date, settlement_hour=None,
+                verified=False, failure_reason="DIRECTION_UNKNOWN_NO_METADATA",
+            )
+        if direction_meta is None:
+            return ContractSemantics(
+                ticker=ticker, canonical_city=city, market_type=mtype,
+                contract_type=contract_type, direction=None,
+                threshold=parsed.get("threshold"), floor_strike=None, cap_strike=None,
+                settlement_date=settlement_date, settlement_hour=None,
+                verified=False, failure_reason=f"UNKNOWN_STRIKE_TYPE:{strike_type_raw}",
+            )
+        if direction_meta == "BAND":
+            return ContractSemantics(
+                ticker=ticker, canonical_city=city, market_type=mtype,
+                contract_type=contract_type, direction=None,
+                threshold=parsed.get("threshold"), floor_strike=None, cap_strike=None,
+                settlement_date=settlement_date, settlement_hour=None,
+                verified=False,
+                failure_reason="STRUCTURAL_MISMATCH:parser=LOW_THRESHOLD,meta=BAND",
+            )
         return ContractSemantics(
             ticker=ticker, canonical_city=city, market_type=mtype,
             contract_type=contract_type, direction=direction_meta,

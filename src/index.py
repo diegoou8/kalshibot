@@ -41,7 +41,7 @@ TEST_MAX_QTY = 2
 # Applied to the RAW model estimate (before any trust shrinkage) so that segments
 # with trust < 1.0 don't get filtered out before the engine can size them down.
 # 8pp = meaningful model disagreement given σ=4°F forecast uncertainty.
-MIN_PROB_EDGE_PP = 8
+MIN_PROB_EDGE_PP = 3
 
 # Minimum net EV per contract in cents after fees before an order may be submitted.
 # Matches DecisionEngine.min_edge_cents. Belt-and-suspenders final guard uses this.

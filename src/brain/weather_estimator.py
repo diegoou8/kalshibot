@@ -95,6 +95,12 @@ _KXTEMP_CITY_ALIAS: Dict[str, str] = {
     "NYCH": "NYC",   # KXTEMPNYCH-... (48 markets observed 2026-06-01)
 }
 
+# KXLOWT daily-low markets (Kalshi launched ~Jun 2026). City codes mostly match
+# _CITY_MAP directly; only exceptions are listed here.
+_KXLOWT_CITY_ALIAS: Dict[str, str] = {
+    "DC": "TDC",   # KXLOWTDC → canonical TDC (Washington DC)
+}
+
 # KXHIGH daily-high markets have accumulated T-prefixed variants and new cities
 # that are not yet in _CITY_MAP.  Alias maps to existing _CITY_MAP entry.
 _KXHIGH_CITY_ALIAS: Dict[str, str] = {
@@ -143,14 +149,22 @@ def normalize_city_code(raw_code: str, market_prefix: Optional[str] = None) -> s
     prefix_up = (market_prefix or "").upper()
     if "TEMP" in prefix_up:
         normed = _KXTEMP_CITY_ALIAS.get(code, code)
+    elif "LOWT" in prefix_up:
+        normed = _KXLOWT_CITY_ALIAS.get(code, code)
     elif "HIGH" in prefix_up:
         normed = _KXHIGH_CITY_ALIAS.get(code, code)
     else:
-        normed = _KXHIGH_CITY_ALIAS.get(code) or _KXTEMP_CITY_ALIAS.get(code) or code
+        normed = (
+            _KXHIGH_CITY_ALIAS.get(code)
+            or _KXLOWT_CITY_ALIAS.get(code)
+            or _KXTEMP_CITY_ALIAS.get(code)
+            or code
+        )
 
     if normed not in _CITY_MAP and normed not in _unknown_city_logged:
         tag = (
             "UNKNOWN_KXTEMP_CITY_CODE" if "TEMP" in prefix_up else
+            "UNKNOWN_KXLOWT_CITY_CODE" if "LOWT" in prefix_up else
             "UNKNOWN_KXHIGH_CITY_CODE" if "HIGH" in prefix_up else
             "UNKNOWN_CITY_CODE"
         )
@@ -251,6 +265,31 @@ def _parse_ticker(ticker: str) -> Optional[Dict]:
         return {"type": "HOURLY_ABOVE", "city": city, "date_str": date_str,
                 "threshold": thresh, "hour": hour}
 
+    # KXLOWT{CITY}-{YYMMMDD}-B{LOWER}.5  (daily low band)
+    m = re.match(
+        r"KXLOWT([A-Z]+)-(\d{2}[A-Z]{3}\d{2})-B(\d+(?:\.\d+)?)",
+        ticker, re.IGNORECASE
+    )
+    if m:
+        city = normalize_city_code(m.group(1).upper(), market_prefix="KXLOWT")
+        date_str = m.group(2).upper()
+        mid = float(m.group(3))
+        lower = float(math.floor(mid))
+        upper = float(math.ceil(mid))
+        return {"type": "LOW_BAND", "city": city, "date_str": date_str,
+                "lower": lower, "upper": upper, "hour": None}
+
+    # KXLOWT{CITY}-{YYMMMDD}-T{THRESH}  (daily low above/below)
+    m = re.match(
+        r"KXLOWT([A-Z]+)-(\d{2}[A-Z]{3}\d{2})-T(\d+(?:\.\d+)?)",
+        ticker, re.IGNORECASE
+    )
+    if m:
+        city = normalize_city_code(m.group(1).upper(), market_prefix="KXLOWT")
+        date_str, thresh = m.group(2).upper(), float(m.group(3))
+        return {"type": "LOW_ABOVE", "city": city, "date_str": date_str,
+                "threshold": thresh, "hour": None}
+
     return None
 
 
@@ -288,6 +327,40 @@ async def _fetch_daily_max(lat: float, lon: float, tz: str, target_date: str) ->
                     return None
                 data = await resp.json()
                 temps = data.get("daily", {}).get("temperature_2m_max", [])
+                if temps and temps[0] is not None:
+                    val = float(temps[0])
+                    _forecast_cache[cache_key] = val
+                    return val
+    except Exception as e:
+        logger.debug("Open-Meteo fetch failed for %s: %s", cache_key, e)
+    return None
+
+
+async def _fetch_daily_min(lat: float, lon: float, tz: str, target_date: str) -> Optional[float]:
+    """Fetch daily min temperature (°F) from Open-Meteo for a given date (KXLOWT markets)."""
+    cache_key = f"{lat:.3f},{lon:.3f},{target_date}_min"
+    if cache_key in _forecast_cache:
+        return _forecast_cache[cache_key]
+
+    params = {
+        "latitude": lat, "longitude": lon,
+        "daily": "temperature_2m_min",
+        "temperature_unit": "fahrenheit",
+        "timezone": tz,
+        "start_date": target_date,
+        "end_date": target_date,
+    }
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
+            async with session.get(
+                "https://api.open-meteo.com/v1/forecast", params=params
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                temps = data.get("daily", {}).get("temperature_2m_min", [])
                 if temps and temps[0] is not None:
                     val = float(temps[0])
                     _forecast_cache[cache_key] = val
@@ -520,6 +593,31 @@ async def estimate_p_yes(
 
     elif contract_type == "THRESHOLD":
         temp = await _fetch_daily_max(lat, lon, tz, iso_date)
+        if temp is None:
+            return None
+        temp_adj = temp + ar1
+        p_above = _p_above(temp_adj, semantics.threshold, sigma_use)
+        if semantics.direction == "BELOW":
+            return 1.0 - p_above
+        return p_above  # direction == "ABOVE"
+
+    elif contract_type == "LOW_BAND":
+        # KXLOWT band: YES if daily_min in [floor, cap). Use temperature_2m_min.
+        temp = await _fetch_daily_min(lat, lon, tz, iso_date)
+        if temp is None:
+            return None
+        temp_adj = temp + ar1
+        p_above_lower = _p_above(temp_adj, semantics.floor_strike, sigma_use)
+        p_above_upper = _p_above(temp_adj, semantics.cap_strike, sigma_use)
+        p_band = p_above_lower - p_above_upper
+        clamped = max(0.03, min(0.97, p_band))
+        if clamped != p_band:
+            logger.debug("PROB_CLAMP_LOW_BAND %s: raw=%.5f -> %.3f", semantics.ticker, p_band, clamped)
+        return float(clamped)
+
+    elif contract_type == "LOW_THRESHOLD":
+        # KXLOWT threshold: YES if daily_min above/below N. Use temperature_2m_min.
+        temp = await _fetch_daily_min(lat, lon, tz, iso_date)
         if temp is None:
             return None
         temp_adj = temp + ar1
